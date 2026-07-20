@@ -1,0 +1,5 @@
+<?jelly escape-by-default='true'?>
+<div>
+    Centralizes AWS authentication (STS AssumeRole with standardized session names)
+    and generic AWS CLI execution for Jenkins deployment pipelines.
+</div>
