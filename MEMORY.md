@@ -97,3 +97,93 @@ mvn hpi:run -Dport=8081
 `jk-${JOB_NAME}-${BUILD_NUMBER}` session name, unit-tested against a
 mocked/stubbed STS client, with no Jenkins integration. Per CLAUDE.md this
 should be testable without `JenkinsRule`.
+
+---
+
+## Session 2 — 2026-07-24
+
+**Milestone: M1 (Auth core in isolation) — COMPLETE**
+
+### Completed work
+
+- Built the authentication core as plain Java under a new `.auth` package, with
+  no `hudson.*`/`jenkins.*` imports and no process execution.
+- STS AssumeRole is abstracted behind a `StsAssumeRole` port interface
+  (Approach C — approved). Only a hand-written fake backs it for now; the real
+  CLI-backed implementation is deferred to a later milestone.
+- Session-name generation (`jk-<job>-<build>`) implemented with STS-constraint
+  sanitization/truncation that preserves the load-bearing `jk-` prefix.
+- 24 new unit tests (pure JUnit 5, no `JenkinsRule`); full `mvn verify` green.
+
+### Files created
+
+| File | Note |
+|---|---|
+| `src/main/java/io/github/rads4/ckaws/auth/CkAwsAuthException.java` | Base, **unchecked** (`extends RuntimeException`) — approved decision |
+| `.../auth/SessionNameException.java` | Invalid job/build → can't form session name |
+| `.../auth/AssumeRoleException.java` | STS/transport failure, actionable message |
+| `.../auth/SessionName.java` | Frozen `jk-<job>-<build>` generation + sanitize/truncate |
+| `.../auth/AwsCredentials.java` | Immutable creds + `Instant expiration`; `Clock`-based `isExpired`/`expiresWithin`; redacting `toString` |
+| `.../auth/AssumeRoleRequest.java` | roleArn + SessionName + optional durationSeconds (validated `[900,3600]`) |
+| `.../auth/StsAssumeRole.java` | Port interface (single AWS seam) |
+| `.../auth/CredentialsProvider.java` | Future refresh seam (unused in M1) |
+| `.../auth/AuthCore.java` | Orchestration: build request → call port → normalize failures |
+| `src/test/.../auth/FakeStsAssumeRole.java` | Hand-written test double (records last request) |
+| `src/test/.../auth/{SessionNameTest,AwsCredentialsTest,AuthCoreTest}.java` | Unit tests |
+
+No pom changes; no production dependencies added; `CLAUDE.md` untouched. M0
+files (`PluginLoadsTest`, etc.) unchanged.
+
+### Build / test status
+
+- `~/.local/bin/mvn verify` → **BUILD SUCCESS** (37s). Tests run: **29**,
+  Failures 0, Errors 0, Skipped 1 (parent `InjectedTest`, normal).
+  New auth tests: SessionName 10, AwsCredentials 8, AuthCore 6.
+- Spotless + SpotBugs clean; `target/ck-aws.hpi` still builds.
+
+### Implementation decisions
+
+1. **Exceptions unchecked** (`CkAwsAuthException extends RuntimeException`),
+   per approval. The Jenkins layer will decide how to surface failures later.
+2. **Approach C** for STS: port interface + hand-written fake now; real
+   transport (planned: `aws sts assume-role` via the M2 generic executor, not
+   the AWS SDK) deferred. No SDK dependency introduced.
+3. **`Clock` injected** for all expiry checks — deterministic tests and a
+   no-redesign path to M4/M5 refresh. `AwsCredentials.expiration` +
+   `CredentialsProvider` are the only refresh hooks; no caching/scheduling.
+4. **Session-name sanitization**: non-`[\w+=,.@-]` chars → `-`, dash-runs
+   collapsed, edges trimmed, middle (job) segment truncated to keep total ≤64
+   while preserving `jk-` prefix + trailing build. Fail-closed on blank job /
+   non-positive build (`SessionNameException`).
+5. **Input-shape validation** in value objects uses standard
+   `IllegalArgumentException`/`NullPointerException`; only domain/auth failures
+   use the `CkAwsAuthException` hierarchy.
+
+### Environment finding (resolved by diagnosis, no machine changes made)
+
+- **`mvn hpi:run` → "Unknown packaging: hpi"** root-caused: since M0 a system
+  Maven **3.8.7** was installed at `/usr/bin/mvn` (apt). The Jenkins parent POM
+  needs **Maven 3.9.6+** to load the `maven-hpi-plugin` build extension that
+  registers `hpi` packaging; 3.8.7 fails to, hence the error. The working
+  `~/.local/bin/mvn` (3.9.16) is unaffected — reproduced both ways.
+- The login shell puts `~/.local/bin` first, so it works interactively; the
+  error appears whenever `mvn` resolves to `/usr/bin/mvn` (non-login shell,
+  IDE terminal, cron). **Not a pom/M1 problem** — M1 is plain Java and never
+  needs `hpi:run`. Fix left to the user (per instruction not to modify PATH):
+  prefer `~/.local/bin/mvn`, or `sudo apt remove maven`. All Maven commands
+  this session used `~/.local/bin/mvn` explicitly.
+- `/etc/maven/settings.xml` has a `<localRepository>/path/to/local/repo</...>`
+  line but it is inert (inside the shipped comment block); irrelevant here.
+
+### Blockers / open items
+
+- Port-8080 conflict from M0 persists (system Jenkins on 8080); still pass
+  `-Dport=8081` for any future `hpi:run`.
+- Real STS transport for the port is intentionally not implemented yet (M2/M3).
+
+### Recommended next milestone
+
+**M2 — One explicit pipeline step** (`ckAws.run([...])`) wiring `AuthCore` (via
+a real `StsAssumeRole` implementation) to the generic `ProcessBuilder`
+executor. This is where the CLI-backed `StsAssumeRole` and the executor first
+appear. Still no RunListener (that's M5).
