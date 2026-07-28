@@ -187,3 +187,204 @@ files (`PluginLoadsTest`, etc.) unchanged.
 a real `StsAssumeRole` implementation) to the generic `ProcessBuilder`
 executor. This is where the CLI-backed `StsAssumeRole` and the executor first
 appear. Still no RunListener (that's M5).
+
+---
+
+## Session 3 — 2026-07-24
+
+**Milestone: M2 (real CLI-backed STS transport + generic executor) — COMPLETE**
+
+> Scope note: the user deliberately narrowed this milestone to the CLI transport
+> and the generic process executor, **excluding** the Jenkins pipeline step. So
+> the `ckAws.run([...])` step from CLAUDE.md's M2 is still deferred — what landed
+> here is the real `StsAssumeRole` implementation plus the reusable executor it
+> runs on. No Jenkins integration yet.
+
+### Completed work
+
+- Added a generic, AWS-unaware process-execution layer (`.exec`) and a
+  CLI-backed `StsAssumeRole` (`.auth.cli`) that swaps in for the M1 fake.
+- **`AuthCore` and every other M1 file are byte-for-byte unchanged** — the only
+  change is which `StsAssumeRole` you construct `AuthCore` with. The M1
+  `FakeStsAssumeRole` and its tests remain in place.
+- No new dependencies (no JSON parser, no AWS SDK); no `pom.xml` change.
+
+### Files created
+
+| File | Note |
+|---|---|
+| `src/main/java/io/github/rads4/ckaws/exec/ProcessRunner.java` | Generic port: run an arbitrary command → result |
+| `.../exec/ProcessResult.java` | Immutable (command, exitCode, stdout, stderr); `toString` omits stream **content** (may hold secrets) |
+| `.../exec/ProcessExecutionException.java` | Execution-layer failure (couldn't start/complete); **stays inside the exec + auth.cli boundary** |
+| `.../exec/DefaultProcessRunner.java` | `ProcessBuilder`-based; inherits env; drains stderr on a helper thread to avoid pipe deadlock; no timeout |
+| `.../auth/cli/CliStsAssumeRole.java` | Builds `aws sts assume-role … --query Credentials.[…] --output text`, parses tab-separated line, maps all failures → `AssumeRoleException` |
+| `src/test/.../exec/FakeProcessRunner.java` | Public hand-written double; `failingExecution(...)` raises the exec exception *inside* exec so adapter tests never import it |
+| `src/test/.../exec/DefaultProcessRunnerTest.java` | Real-process tests (POSIX `sh`; `@DisabledOnOs(WINDOWS)`) |
+| `src/test/.../auth/cli/CliStsAssumeRoleTest.java` | Command construction, parsing, error mapping, + AuthCore-swap test |
+
+### Build / test status
+
+- `~/.local/bin/mvn verify` → **BUILD SUCCESS** (~19s). Tests run: **44**,
+  Failures 0, Errors 0, Skipped 1 (parent `InjectedTest`). New this milestone:
+  CliStsAssumeRole 11, DefaultProcessRunner 4.
+- Spotless + SpotBugs clean (0 bugs); `target/ck-aws.hpi` still builds.
+
+### Implementation decisions
+
+1. **Dependency-free credential extraction** (approved): the CLI's own
+   `--query Credentials.[AccessKeyId,SecretAccessKey,SessionToken,Expiration]
+   --output text` yields one tab-separated line; split on `\t`. No JSON library.
+   Expiration parsed via `OffsetDateTime.parse(...).toInstant()` (CLI emits
+   `+00:00`, which `Instant.parse` rejects); falls back to `Instant.parse`.
+2. **Executor is strictly generic** (approved): `ProcessRunner` executes any
+   argument list and has zero AWS/Jenkins awareness — it is the reusable seed of
+   the future `ckAws.run([...])` executor. STS specifics live *only* in
+   `CliStsAssumeRole`. No per-service branching anywhere.
+3. **`ProcessExecutionException` does not leak** (approved): it is referenced
+   only in `.exec` (defined + thrown) and caught/mapped inside `CliStsAssumeRole`.
+   The rest of the project sees only `AssumeRoleException`, so authentication's
+   transport (process vs SDK vs anything) is invisible upstream. It is retained
+   as the exception *cause* for diagnostics — visible only if a caller unwraps
+   `getCause()`, not in the thrown type or any signature.
+4. **`AuthCore` unchanged** (approved): swap is construction-time only —
+   `new AuthCore(new CliStsAssumeRole(new DefaultProcessRunner()))`.
+5. **No timeout** (deferred to M4): `DefaultProcessRunner` blocks on
+   `waitFor()`. Acceptable for M2/M3 (`get-caller-identity`/`assume-role` are
+   fast); a hung `aws` would block — revisit with retry/timeout in M4.
+6. **Base identity / region** come from the inherited process environment
+   (`AWS_PROFILE`, `AWS_DEFAULT_REGION`, instance metadata). The plugin still
+   does **not** read `~/.aws/config`; the CLI resolves ambient creds itself.
+
+### Blockers / open items
+
+- Still no live STS call exercised — `CliStsAssumeRole` is unit-tested only
+  (faked runner). First real `aws` invocation happens at **M3** against the
+  read-only NonProd profile, with CloudTrail verification of the `jk-<job>-<build>`
+  session name. That is also the first time the `aws` CLI binary + real AWS
+  credentials/region are required in the environment.
+- Port-8080 conflict and the Maven-3.8.7 `hpi:run` trap (Session 2) still stand.
+
+### Recommended next milestone
+
+**M3 — POC success criterion.** Wire a real pipeline job on local Jenkins to
+`AuthCore(new CliStsAssumeRole(new DefaultProcessRunner()))`, run
+`ckAws.run(["sts", "get-caller-identity"])` against the NonProd read-only
+profile, and confirm CloudTrail shows the session as `jk-<job>-<build>`. This
+milestone finally introduces the Jenkins pipeline step (the piece deferred out
+of this session's M2) and the generic-executor path for arbitrary AWS CLI
+commands.
+
+---
+
+## Session 4 — 2026-07-28
+
+**Milestone: M3 (first Jenkins integration point) — COMPLETE**
+
+> **Scope note — read this before comparing against CLAUDE.md.** The user
+> narrowed M3 to *Jenkins integration only*: **no live AWS, no CloudTrail, no
+> generic AWS command execution**. So what landed is the explicit pipeline step
+> CLAUDE.md assigns to M2 (deferred out of Session 3), not CLAUDE.md's M3
+> success criterion. **Live AssumeRole + CloudTrail validation of
+> `jk-<job>-<build>` is still outstanding** and is the next session's work.
+> `CLAUDE.md` was deliberately not modified.
+
+### Completed work
+
+- Added `ckAwsAssumeRole`, the plugin's first Pipeline step, in a new `.steps`
+  package. It bridges Jenkins to the existing stack and owns nothing else.
+- **M1 and M2 are byte-for-byte unchanged** (verified via `git diff`: among
+  tracked files only `pom.xml` changed). The step composes them at
+  construction time exactly as Session 3 predicted.
+- 8 new `JenkinsRule` tests driving the *real* path Step → AuthCore →
+  CliStsAssumeRole → DefaultProcessRunner → a real subprocess, using stub
+  `aws` shell scripts. No AWS account, credentials, or AWS CLI required.
+- Verified on a live `hpi:run` Jenkins: plugin `active=true`, 0 load errors,
+  and `ckAwsAssumeRole` / "Assume an AWS role for this build" both present in
+  the Snippet Generator.
+
+### Files created / modified
+
+| File | Note |
+|---|---|
+| `src/main/java/io/github/rads4/ckaws/steps/CkAwsAssumeRoleStep.java` | The step, its `Execution`, and `DescriptorImpl` |
+| `src/test/java/io/github/rads4/ckaws/steps/CkAwsAssumeRoleStepTest.java` | 8 `@WithJenkins` tests, `@DisabledOnOs(WINDOWS)` |
+| `pom.xml` | 3 workflow dependencies + **BOM downgrade** (see decision 6) |
+
+### Public API
+
+```groovy
+def session = ckAwsAssumeRole(roleArn: 'arn:aws:iam::123456789012:role/non_prod')
+// session == 'jk-<job>-<build>'
+```
+
+### Build / test status
+
+- `~/.local/bin/mvn verify` → **BUILD SUCCESS**. Tests run: **52**, Failures 0,
+  Errors 0, Skipped 1 (parent `InjectedTest`). New this milestone: 8.
+- Spotless clean; SpotBugs `BugInstance size is 0`.
+
+### Implementation decisions
+
+1. **Returns only the session name** (approved). No credential material — not
+   even `AccessKeyId` — reaches the Pipeline DSL, because anything returned is
+   persisted in CPS program state and trivially printable. The credentials from
+   `authenticate(...)` are deliberately discarded; exporting them is a future
+   `withProfile`-block concern.
+2. **`SynchronousNonBlockingStepExecution`**: the AssumeRole call blocks on a
+   subprocess, and blocking the CPS VM thread would stall the whole flow.
+   `AuthCore` is built inside `run()` and never held in a field, so the
+   execution stays serializable for pipeline durability.
+3. **Session name computed in the step** via `SessionName.forBuild(...)` before
+   calling `AuthCore` (which derives the same value internally). Deterministic
+   and side-effect-free, so this fails closed *before* spawning a process and
+   supplies the return value **without changing AuthCore's M1 signature**.
+4. **`CkAwsAuthException` → `AbortException`**: Jenkins' idiom for an expected,
+   user-actionable failure — message only, no stack trace. Anything else
+   propagates untouched (a real bug deserves its trace). The **root cause's
+   message** is logged, never the exception object: printing it leaked
+   `ProcessExecutionException` into the build log and broke M2's decision 3
+   (transport invisible upstream). A test now asserts that specifically.
+5. **`io.github.rads4.ckaws.awsExecutable` system property** (approved)
+   overrides the `aws` binary. Required for testing: the child process inherits
+   the JVM environment, so a test cannot prepend to `PATH` in-process. Uses
+   `CliStsAssumeRole`'s existing 2-arg constructor — no M2 change.
+6. **BOM downgraded `5054.v620b_5d2b_d5e6` → `4488.v7fe26526366e`.** *Not*
+   cosmetic — see blockers below.
+7. **No `workflow-basic-steps`** (so no `echo`): it transitively drags
+   `instance-identity` 203, which also requires 2.479.3. Tests assert the
+   return value with plain Groovy `assert` inside the pipeline instead. This
+   was verified not to be a vacuous check by deliberately breaking the expected
+   value and confirming the build fails.
+8. **Runs on the controller JVM**, not the agent (approved, POC-only).
+   `node {}` is ignored. Future fix is a `LauncherProcessRunner implements
+   ProcessRunner` — purely additive, zero auth-layer change.
+9. `getFullName()` not `getName()`, so folder paths enter the session name and
+   get sanitized. Jenkins rejects most punctuation in job names but allows
+   spaces, so the sanitization test uses `"my awkward job"` → `jk-my-awkward-job-1`.
+
+### Blockers / open items
+
+- **The 2.479 LTS line has moved past CK production.** Every plugin BOM release
+  after `4488` pins `workflow-cps >= 4050`, whose manifest requires **Jenkins
+  2.479.3**; `validate-hpi` then refuses to build against our 2.479.2 baseline.
+  Newest workflow-cps still on 2.479.1 is `4046.v90b_1b_9edec67`, pinned by BOM
+  `4488`. Keeping the M0 guarantee ("loadable on CK's real instance") therefore
+  costs a **several-months-old tested-together dependency set**, and every new
+  plugin dependency risks dragging in another 2.479.3 requirement (this already
+  happened twice this session). **Decision to raise with the Platform team:
+  either CK takes the 2.479.3 patch, or this plugin stays on an ageing BOM.**
+- **Still no live STS call.** `aws` CLI *is* installed locally
+  (`/usr/local/bin/aws`), so the next session can attempt it — but it was
+  deliberately not exercised here per the milestone's no-live-AWS constraint.
+- `mvn hpi:run` serves Jenkins under the **`/jenkins` context path**
+  (`http://localhost:8081/jenkins`), and anonymous **POST is 403** — creating
+  or triggering jobs via `curl` needs authentication. UI use is unaffected.
+- Port-8080 conflict and the Maven-3.8.7 `hpi:run` trap (Sessions 1–2) stand.
+
+### Recommended next milestone
+
+**CLAUDE.md's original M3 — live validation.** Point `ckAwsAssumeRole` at the
+real NonProd read-only role on local Jenkins, confirm AssumeRole succeeds, and
+verify CloudTrail Event History shows the session as `jk-<job>-<build>`. That
+closes the POC success criterion. The generic `ckAws.run([...])` execution step
+and `sts get-caller-identity` remain unimplemented and are a separate decision.
