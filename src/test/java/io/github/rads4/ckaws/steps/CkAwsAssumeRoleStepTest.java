@@ -26,10 +26,10 @@ import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /**
- * Milestone M3 tests: the Jenkins integration point.
+ * Tests for the Jenkins integration point.
  *
- * <p>{@link JenkinsRule} is genuinely required here — this milestone <em>is</em> extension registration
- * and DSL wiring. Every test drives the real path Step -&gt; AuthCore -&gt; CliStsAssumeRole -&gt;
+ * <p>{@link JenkinsRule} is genuinely required here — what is under test <em>is</em> extension
+ * registration and DSL wiring. Every test drives the real path Step -&gt; AuthCore -&gt; CliStsAssumeRole -&gt;
  * DefaultProcessRunner -&gt; a real subprocess, with a stub {@code aws} script standing in for the AWS
  * CLI. No AWS account, no credentials and no installed AWS CLI are needed.
  *
@@ -48,14 +48,9 @@ class CkAwsAssumeRoleStepTest {
     @TempDir
     private Path tmp;
 
-    /** The profile the M4 stubs below insist on seeing, standing in for the real {@code ops-admin}. */
-    private static final String TEST_PROFILE = "ck-test-profile";
-
     @AfterEach
-    void clearSystemPropertyOverrides() {
+    void clearExecutableOverride() {
         System.clearProperty(CkAwsAssumeRoleStep.AWS_EXECUTABLE_PROPERTY);
-        System.clearProperty(CkAwsAssumeRoleStep.AWS_PROFILE_PROPERTY);
-        System.clearProperty(CkAwsAssumeRoleStep.VALIDATE_IDENTITY_PROPERTY);
     }
 
     @Test
@@ -167,63 +162,6 @@ class CkAwsAssumeRoleStepTest {
         assertEquals(FormValidation.Kind.OK, descriptor.doCheckRoleArn(ROLE).kind);
     }
 
-    // --- temporary M4 validation path (delete with the scaffolding in M5) ----
-
-    /**
-     * The whole M4 mechanism in one test. The stub {@code aws} refuses to play along unless every part is
-     * wired correctly, so a green build here means: the profile override reached the AssumeRole call, it
-     * was <em>removed</em> again for the identity check, the temporary credentials were passed by
-     * environment, and the session name generated from this job/build survived the round trip.
-     */
-    @Test
-    void identityCheckConfirmsTheSessionNameUsingTheTemporaryCredentials(JenkinsRule j) throws Exception {
-        useStub(liveValidationStub(tmp.resolve("session.txt"), true));
-        System.setProperty(CkAwsAssumeRoleStep.AWS_PROFILE_PROPERTY, TEST_PROFILE);
-        System.setProperty(CkAwsAssumeRoleStep.VALIDATE_IDENTITY_PROPERTY, "true");
-
-        WorkflowJob job = j.createProject(WorkflowJob.class, "live");
-        // Unchanged M3 DSL: enabling validation is invisible to the pipeline.
-        job.setDefinition(new CpsFlowDefinition(assertingScript("jk-live-1"), true));
-
-        WorkflowRun build = j.buildAndAssertSuccess(job);
-
-        j.assertLogContains("[ck-aws] AWS CLI profile: " + TEST_PROFILE + " (temporary M4 override)", build);
-        j.assertLogContains("assumed-role/non_prod/jk-live-1", build);
-        j.assertLogContains("[ck-aws] Session name confirmed in caller identity: jk-live-1", build);
-    }
-
-    @Test
-    void identityCheckFailsWhenTheCallerIsNotTheAssumedSession(JenkinsRule j) throws Exception {
-        // The stub answers with the *base* identity, i.e. what a leaked AWS_PROFILE would have produced.
-        useStub(liveValidationStub(tmp.resolve("session.txt"), false));
-        System.setProperty(CkAwsAssumeRoleStep.AWS_PROFILE_PROPERTY, TEST_PROFILE);
-        System.setProperty(CkAwsAssumeRoleStep.VALIDATE_IDENTITY_PROPERTY, "true");
-
-        WorkflowJob job = j.createProject(WorkflowJob.class, "wrongidentity");
-        job.setDefinition(new CpsFlowDefinition("ckAwsAssumeRole(roleArn: '" + ROLE + "')\n", true));
-
-        WorkflowRun build = j.assertBuildStatus(Result.FAILURE, job.scheduleBuild2(0));
-        String log = JenkinsRule.getLog(build);
-
-        assertTrue(log.contains("does not contain the expected session name"), "should explain the mismatch");
-        assertTrue(log.contains("jk-wrongidentity-1"), "should name the expected session");
-        assertFalse(log.contains("\tat io.github.rads4"), "should not print a Java stack trace");
-    }
-
-    @Test
-    void noIdentityCheckHappensUnlessTheValidationPropertyIsSet(JenkinsRule j) throws Exception {
-        Path args = tmp.resolve("argv.txt");
-        useStub(argvRecordingStub(args));
-
-        WorkflowJob job = j.createProject(WorkflowJob.class, "novalidation");
-        job.setDefinition(new CpsFlowDefinition("ckAwsAssumeRole(roleArn: '" + ROLE + "')\n", true));
-        j.buildAndAssertSuccess(job);
-
-        assertFalse(
-                Files.readAllLines(args, StandardCharsets.UTF_8).contains("get-caller-identity"),
-                "exactly one AWS call should be made when validation is off");
-    }
-
     // --- pipeline scripts ---------------------------------------------------
 
     /**
@@ -250,53 +188,6 @@ class CkAwsAssumeRoleStepTest {
                 "aws-argv",
                 "#!/bin/sh\n" + "for a in \"$@\"; do echo \"$a\" >> '" + argsFile + "'; done\n" + "printf '"
                         + CREDENTIAL_LINE + "'\n");
-    }
-
-    /**
-     * Stands in for the AWS CLI across both calls of an M4 validation run, and asserts the environment it
-     * is handed. {@code assume-role} must see {@code AWS_PROFILE}; {@code get-caller-identity} must see the
-     * issued credentials and must <em>not</em> see {@code AWS_PROFILE}. It echoes back the session name it
-     * was given for AssumeRole, so nothing about the expected name is hardcoded in the stub.
-     *
-     * @param correctIdentity when false, answer with the base identity instead of the assumed session —
-     *     the false-positive a leaked {@code AWS_PROFILE} would produce.
-     */
-    private Path liveValidationStub(Path sessionFile, boolean correctIdentity) throws IOException {
-        String printIdentity = correctIdentity
-                ? "printf '123456789012\\tarn:aws:sts::123456789012:assumed-role/non_prod/%s"
-                        + "\\tAROAEXAMPLE:%s\\n' \"$s\" \"$s\""
-                : "printf '123456789012\\tarn:aws:iam::123456789012:user/base-identity\\tAIDABASE\\n'";
-        return writeScript(
-                "aws-live",
-                "#!/bin/sh\n"
-                        + "case \"$2\" in\n"
-                        + "  assume-role)\n"
-                        + "    if [ \"$AWS_PROFILE\" != '" + TEST_PROFILE + "' ]; then\n"
-                        + "      echo \"expected AWS_PROFILE=" + TEST_PROFILE
-                        + " but saw '${AWS_PROFILE}'\" >&2; exit 90\n"
-                        + "    fi\n"
-                        + "    prev=''\n"
-                        + "    for a in \"$@\"; do\n"
-                        + "      if [ \"$prev\" = '--role-session-name' ]; then printf %s \"$a\" > '"
-                        + sessionFile + "'; fi\n"
-                        + "      prev=\"$a\"\n"
-                        + "    done\n"
-                        + "    printf '" + CREDENTIAL_LINE + "'\n"
-                        + "    ;;\n"
-                        + "  get-caller-identity)\n"
-                        + "    if [ -n \"${AWS_PROFILE+set}\" ]; then\n"
-                        + "      echo 'AWS_PROFILE leaked into the identity check' >&2; exit 91\n"
-                        + "    fi\n"
-                        + "    if [ \"$AWS_ACCESS_KEY_ID\" != 'ASIAEXAMPLE' ]; then\n"
-                        + "      echo \"temporary credentials were not passed\" >&2; exit 92\n"
-                        + "    fi\n"
-                        + "    s=$(cat '" + sessionFile + "')\n"
-                        + "    " + printIdentity + "\n"
-                        + "    ;;\n"
-                        + "  *)\n"
-                        + "    echo \"unexpected call: $*\" >&2; exit 93\n"
-                        + "    ;;\n"
-                        + "esac\n");
     }
 
     private Path failingStub() throws IOException {
