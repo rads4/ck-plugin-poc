@@ -388,3 +388,191 @@ real NonProd read-only role on local Jenkins, confirm AssumeRole succeeds, and
 verify CloudTrail Event History shows the session as `jk-<job>-<build>`. That
 closes the POC success criterion. The generic `ckAws.run([...])` execution step
 and `sts get-caller-identity` remain unimplemented and are a separate decision.
+
+---
+
+## Session 5 — 2026-07-30
+
+**Milestone: M4 (live STS validation against real AWS) — COMPLETE**
+(CloudTrail confirmation is the one item left, and is deliberately manual.)
+
+> **Scope note — read this before comparing against CLAUDE.md.** The user
+> redefined M4: CLAUDE.md lists M4 as the retry/timeout/structured-logging
+> stretch goal, but this session's M4 was **live validation** — i.e. CLAUDE.md's
+> *original M3 success criterion*, which Session 4 deliberately deferred. **No
+> retry, timeout, caching, refresh or logging work was done.** The target account
+> is also not NonProd: a dedicated least-privilege validation role in the **Ops**
+> account was used instead (see below). `CLAUDE.md` was deliberately not modified.
+
+### Completed work
+
+- Ran the full stack against **real AWS** from local Jenkins, twice, and
+  confirmed the `jk-<job>-<build>` convention survives real STS.
+- Added the one capability the milestone genuinely required: per-invocation
+  **environment overrides** on `DefaultProcessRunner`. Everything else is
+  temporary scaffolding.
+- **The entire `.auth` layer is byte-for-byte unchanged** — `git diff` touches
+  zero files under `src/main/java/io/github/rads4/ckaws/auth/`. `AuthCore`,
+  `SessionName`, `CliStsAssumeRole` and the `ProcessRunner` port were not
+  modified. **The Pipeline DSL is unchanged from M3.**
+- 6 new tests (52 → 58); `mvn verify` green, SpotBugs 0, Spotless clean.
+
+### Live validation evidence (real AWS, account 685502069032)
+
+Base identity (`ops-admin`, CK SAML):
+`arn:aws:sts::685502069032:assumed-role/CKPrism-AdministratorAccess/radhika.awasthi@cloudkeeper.com`
+— matches the principal in `trust-policy.json`.
+
+Build log of job `ck-aws-live` #2, verbatim:
+
+```
+[ck-aws] AWS CLI profile: ops-admin (temporary M4 override)
+[ck-aws] Assuming role arn:aws:iam::685502069032:role/ck-jenkins-plugin-validation-role as session jk-ck-aws-live-2
+[ck-aws] Assumed role  ... as session jk-ck-aws-live-2
+[ck-aws] Caller identity: 685502069032	arn:aws:sts::685502069032:assumed-role/ck-jenkins-plugin-validation-role/jk-ck-aws-live-2	AROAZ7GY3PEUKA3CDG6XM:jk-ck-aws-live-2
+[ck-aws] Session name confirmed in caller identity: jk-ck-aws-live-2
+Finished: SUCCESS
+```
+
+Build #1 produced the identical shape with `jk-ck-aws-live-1`, so the session
+name is confirmed **build-scoped**, not merely well-formed.
+
+| Claim | Evidence |
+|---|---|
+| Pipeline step, AuthCore, CliStsAssumeRole, DefaultProcessRunner all work | build SUCCESS with both AWS calls answering |
+| AssumeRole succeeds against a real role | "Assumed role" line |
+| Temporary credentials are valid | `get-caller-identity` answered as the **assumed role**, with `AWS_PROFILE` stripped |
+| Session name is correct | `.../ck-jenkins-plugin-validation-role/jk-ck-aws-live-2` |
+| Profile selection works | AssumeRole succeeded only via the `ops-admin` base identity |
+| Exactly two AWS APIs called | `sts:AssumeRole`, `sts:GetCallerIdentity` — nothing else exists in the code path |
+
+### Files created / modified
+
+| File | Note |
+|---|---|
+| `.../exec/DefaultProcessRunner.java` | **PERMANENT.** New `run(command, Map)` overload; `null` value **removes** a variable. `run(command)` delegates with an empty map — behaviour unchanged. Still zero AWS awareness. |
+| `.../steps/CkAwsAssumeRoleStep.java` | **TEMPORARY parts only** (see removal list): 2 property constants, `verifyIdentity`, `temporaryProfileEnvironment`, and the runner-decorating lambda. |
+| `src/test/.../exec/DefaultProcessRunnerTest.java` | +3 tests (override applies / inheritance survives / null removes). Field retyped to `DefaultProcessRunner`. |
+| `src/test/.../steps/CkAwsAssumeRoleStepTest.java` | +3 tests and a two-mode stub `aws`. |
+| `README.md` | Status line refreshed; new **"Live AWS validation (M4)"** section (temporary); project layout updated. |
+
+No `pom.xml` change and **no new dependencies**. No AWS CLI config, IAM policy,
+role or trust policy was created or modified. No existing deployment library was
+touched.
+
+### Build / test status
+
+- `~/.local/bin/mvn verify` → **BUILD SUCCESS**. Tests run: **58**, Failures 0,
+  Errors 0, Skipped 1 (parent `InjectedTest`, normal). SpotBugs `BugInstance
+  size is 0`; Spotless clean.
+- New: `DefaultProcessRunnerTest` 4 → 7, `CkAwsAssumeRoleStepTest` 8 → 11.
+
+### Implementation decisions
+
+1. **No new Pipeline parameter** (per instruction). Validation is enabled by the
+   system property `io.github.rads4.ckaws.validateIdentity`, so the step's public
+   API is identical to M3. A test asserts no `get-caller-identity` call happens
+   when the property is unset.
+2. **No new package or adapter class.** The identity check is ~25 lines of
+   private methods inside the step. Putting a `CliStsGetCallerIdentity` in
+   `.auth.cli` would have created a permanent-looking class for temporary work;
+   duplicating the executor would have meant the milestone validated a *copy* of
+   `DefaultProcessRunner` rather than the real one.
+3. **`ProcessRunner` (the port) was not modified** — the env overload lives only
+   on the concrete class. Because `ProcessRunner` is a `@FunctionalInterface`,
+   the profile override is injected as a one-line decorating lambda in the step,
+   which is why `CliStsAssumeRole` and `AuthCore` needed no change at all.
+4. **`AWS_PROFILE`/`AWS_DEFAULT_PROFILE` are removed for the identity check**,
+   and the check runs with the *same base environment* the AssumeRole call got.
+   This is the milestone's most important detail: with the profile left in place
+   the AWS CLI can answer from the **base** identity, so `get-caller-identity`
+   would succeed and print a plausible ARN while proving nothing. The
+   session-name assertion is what makes the check real.
+5. **Non-vacuity verified, not assumed.** Deleting the `AWS_PROFILE` strip was
+   confirmed to fail 2 tests (`exit 91: AWS_PROFILE leaked into the identity
+   check`) before the line was restored. An earlier version of the same test
+   *did* pass without the strip — the identity check simply never had the
+   variable set — which is why the base environment is now threaded through.
+6. **No region default in code** (per instruction). If no region resolves, the
+   AWS CLI's own error is surfaced verbatim and the build fails.
+7. **Credentials travel by environment, never argv.** Process arguments are
+   world-readable via `ps` and `/proc/<pid>/cmdline`; environment is not. This is
+   also why the `env VAR=... aws ...` trick — which would have avoided the
+   executor change entirely — was rejected.
+8. **Credentials still never reach the Pipeline DSL.** `authenticate(...)`'s
+   result is held in a local for the length of one method and is the sole
+   consumer of the temporary check; the step still returns only the session name
+   (M3 decision 1 intact). Nothing credential-bearing is logged.
+9. **Log line order** was corrected after the first live run, then the plugin was
+   rebuilt and **re-validated live** (build #2), so the committed code is exactly
+   what was validated.
+
+### Environment findings
+
+- **`ops-admin` is `us-east-1` but the `default` profile is `eu-west-2`.**
+  Because the identity check strips `AWS_PROFILE`, the CLI falls back to the
+  `default` profile for *config*, so the two calls would otherwise land in
+  **different CloudTrail regions** (Event History is per-region). Both runs were
+  therefore launched with `AWS_DEFAULT_REGION=us-east-1`, which is inherited by
+  both children and is not a profile, so the strip does not remove it.
+- **Session 4's "anonymous POST is 403" is resolved:** it was CSRF, not auth.
+  With a cookie jar plus a crumb from `/crumbIssuer/api/xml`, `createItem` and
+  `build` both work over `curl` (HTTP 200 / 201). Useful for scripted validation.
+- **`pkill -f "hpi:run"` does not stop Jenkins** — it kills the Maven wrapper
+  while the forked Jenkins JVM keeps holding port 8081, so the next `hpi:run`
+  dies with `Failed to start Jetty` *and* you may unknowingly keep testing the
+  **old** plugin build. Kill the PID listening on 8081 (`ss -ltnp`) instead.
+- Port-8080 conflict and the Maven-3.8.7 `hpi:run` trap (Sessions 1–2) stand.
+
+### Outstanding: CloudTrail (manual, deliberately not automated)
+
+In account **685502069032**, region **us-east-1**, CloudTrail → Event history
+(allow ~15 min for delivery):
+
+1. Event name `AssumeRole` → confirm `requestParameters.roleSessionName` is
+   **`jk-ck-aws-live-1`** and **`jk-ck-aws-live-2`** (not an auto-generated
+   name), `requestParameters.roleArn` is the validation role, and
+   `userIdentity.arn` contains `CKPrism-AdministratorAccess`.
+2. Event name `GetCallerIdentity` → confirm `userIdentity.arn` ends in
+   `assumed-role/ck-jenkins-plugin-validation-role/jk-ck-aws-live-<n>`. This is
+   the independent proof the temporary credentials, not the base profile, made
+   the call.
+3. Confirm no other event names appear from those sessions.
+
+Until step 1 is eyeballed, the POC's headline claim is evidenced only by
+`get-caller-identity` (which already embeds the session name in its ARN), not by
+CloudTrail itself.
+
+### To delete in M5 (the whole temporary surface)
+
+1. In `CkAwsAssumeRoleStep.java`: the `AWS_PROFILE_PROPERTY` and
+   `VALIDATE_IDENTITY_PROPERTY` constants, the `verifyIdentity` and
+   `temporaryProfileEnvironment` methods, the `if (SystemProperties.getBoolean
+   (...))` block, and the runner lambda — reverting to
+   `new CliStsAssumeRole(processRunner, awsExecutable())`. Also the
+   `AwsCredentials`/`ProcessResult`/`ProcessRunner`/`HashMap`/`List`/`Map`
+   imports and the M4 paragraph in the class javadoc.
+2. The 3 M4 tests plus `liveValidationStub` and `TEST_PROFILE` in
+   `CkAwsAssumeRoleStepTest`.
+3. The README "Live AWS validation (M4)" section.
+4. **Retained deliberately:** the `DefaultProcessRunner` env overload and its 3
+   tests (approved as a permanent generic executor improvement — it is exactly
+   what a `withProfile` block needs to export credentials).
+
+After that, `git diff` against Session 4 is one added method in
+`DefaultProcessRunner`.
+
+### Recommended next milestone
+
+Two candidates, and they are independent:
+
+- **The generic execution step** (`ckAws.run([...])`, CLAUDE.md's M2/DoD item).
+  This is the last unmet Definition-of-Done line: `get-caller-identity` has now
+  run *through* the generic executor, but only from temporary internal code — no
+  pipeline-callable generic AWS CLI step exists yet.
+- **M5 as CLAUDE.md defines it** — JCasC-backed profile→role config, which is
+  the real replacement for this session's temporary `awsProfile` property, plus
+  the RunListener path.
+
+Also still open from Session 4: the **BOM/2.479.3 decision** for the Platform
+team, unchanged by this session.
