@@ -291,3 +291,34 @@ This decision requires technical justification based on maintainability,
 ownership, release process, and CK's organizational standards — it is not
 being made now, and nothing in this document should be read as favoring one
 option over another.
+
+## Documentation Maintenance
+
+At the end of every completed implementation session:
+
+1. Update `MEMORY.md`.
+   - Record the milestone or task completed.
+   - Record important architectural decisions.
+   - Record validation performed.
+   - Record issues encountered.
+   - Record any deviations from the original plan.
+
+2. Review `README.md`.
+   Update it whenever user-facing behavior changes, including:
+   - new features
+   - removed features
+   - completed milestones
+   - installation changes
+   - usage changes
+   - limitations
+   - roadmap
+
+3. Do NOT modify `CLAUDE.md` automatically.
+
+`CLAUDE.md` is the project's architectural contract and should only be updated when:
+- the architecture changes,
+- new long-term design decisions are made,
+- project scope changes,
+- or I explicitly ask for it.
+
+If no architectural decisions changed during a session, leave `CLAUDE.md` untouched and state that no update was necessary.
