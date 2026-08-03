@@ -640,11 +640,11 @@ Skim on the way past (don't stop for them): `AssumeRoleRequest`, `AwsCredentials
 `ProcessResult`, and the exception classes — they are small value types, and
 their javadoc explains itself when you reach them.
 
-> **⚠️ One stale document.** The README's *"Live AWS validation (M4)"* section
-> describes `io.github.rads4.ckaws.awsProfile` and
-> `io.github.rads4.ckaws.validateIdentity` system properties, and
-> `verifyIdentity` / `temporaryProfileEnvironment` methods. **These were removed
-> in M5 and no longer exist.** The only system property the code still reads is
+> **Note on removed properties.** Earlier drafts of the README described
+> `io.github.rads4.ckaws.awsProfile` and `io.github.rads4.ckaws.validateIdentity`
+> system properties, and `verifyIdentity` / `temporaryProfileEnvironment`
+> methods. **These were removed in M5 and no longer exist** — the README has
+> been corrected. The only system property the code still reads is
 > `io.github.rads4.ckaws.awsExecutable` (test hook to substitute the `aws`
 > binary).
 

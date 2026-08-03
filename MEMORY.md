@@ -576,3 +576,137 @@ Two candidates, and they are independent:
 
 Also still open from Session 4: the **BOM/2.479.3 decision** for the Platform
 team, unchanged by this session.
+
+---
+
+## Session 6 — 2026-07-30
+
+**Milestone: M5 (production packaging and cleanup) — COMPLETE**
+
+> **Scope note.** CLAUDE.md's M5 is "RunListener automatic default-profile
+> injection, JCasC-backed profile/role config". This session's M5 was
+> **different**: removing the temporary M4 validation surface and getting the
+> plugin into an installable state. **No RunListener and no JCasC work was
+> done** — both remain unimplemented. `CLAUDE.md` was deliberately not modified.
+
+### Completed work
+
+- Deleted the entire temporary M4 validation surface listed in Session 5's
+  "To delete in M5" checklist. Verified complete: no `awsProfile`,
+  `validateIdentity`, `verifyIdentity` or `temporaryProfileEnvironment` symbol
+  remains anywhere in `src/`.
+- Refreshed the `package-info.java` javadoc, which still described the plugin as
+  "Scaffold only (milestone M0)".
+- Added [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) — a full codebase
+  walkthrough (architecture, runtime flow, per-file reference, design decisions,
+  extension points, reading order) for a new maintainer.
+- `CLAUDE.md` gained a **Documentation Maintenance** section (process, not
+  architecture): update MEMORY.md and review README.md at the end of every
+  session; never modify CLAUDE.md automatically.
+
+### Files modified
+
+| File | Note |
+|---|---|
+| `.../steps/CkAwsAssumeRoleStep.java` | −134/+15: temporary constants, `verifyIdentity`, `temporaryProfileEnvironment`, the runner-decorating lambda, the M4 javadoc paragraph and the now-unused imports all removed. Reverted to `new CliStsAssumeRole(new DefaultProcessRunner(), awsExecutable())` |
+| `.../steps/CkAwsAssumeRoleStepTest.java` | −113/+4: the 3 M4 tests, `liveValidationStub`, `TEST_PROFILE` and the property-clearing `@AfterEach` removed. Back to 8 tests |
+| `.../package-info.java` | "Scaffold only (M0)" wording dropped |
+| `docs/DEVELOPER_GUIDE.md` | New |
+| `CLAUDE.md` | Documentation Maintenance section (explicitly requested) |
+
+**Retained deliberately** (approved in Session 5 as a permanent generic-executor
+improvement): `DefaultProcessRunner.run(List, Map)` and its 3 tests. It is
+exactly what a future `withProfile` block needs to export credentials, and it
+carries no AWS awareness.
+
+### Net effect
+
+Against Session 4, the only production-code difference is the one added overload
+in `DefaultProcessRunner`. `AuthCore`, `SessionName`, `AssumeRoleRequest`,
+`AwsCredentials`, `CliStsAssumeRole`, the `ProcessRunner` port and the Pipeline
+DSL are all unchanged. The step's only remaining system property is
+`io.github.rads4.ckaws.awsExecutable` (the test hook from M3).
+
+---
+
+## Session 7 — 2026-08-03
+
+**Task: production release verification (no code changes) — COMPLETE**
+
+Verification pass ahead of the first installation on Infra Jenkins. No feature
+work, no refactoring, no architecture or authentication changes.
+
+### Repository review
+
+| Check | Result |
+|---|---|
+| Temporary M4 validation code remaining | None — grep for `awsProfile`/`validateIdentity`/`verifyIdentity`/`temporaryProfileEnvironment` across `src/` returns nothing |
+| Experimental code | None |
+| TODO / FIXME / XXX / HACK affecting production | None (the only "temporary" hits are javadoc prose about *temporary credentials*) |
+| Unused imports | None — every import in all 12 production and 10 test files is referenced; Spotless clean |
+| Dead code | None introduced during development. `CredentialsProvider` is unused but is a deliberate M1 seam documented as such, not a leftover |
+| `pom.xml` | Clean; no experimental dependencies. 3 workflow deps (1 compile, 2 test) + the pinned BOM |
+
+### Release verification — `mvn clean verify`
+
+**BUILD SUCCESS** (2m40s, finished 2026-08-03T16:14:55+05:30).
+
+- Tests run **55**, Failures 0, Errors 0, Skipped 1 (parent `InjectedTest`, normal).
+  AuthCore 6, AwsCredentials 8, SessionName 10, CliStsAssumeRole 11,
+  DefaultProcessRunner 7, CkAwsAssumeRoleStep 8, PluginLoads 1, InjectedTest 4.
+- SpotBugs: `BugInstance size is 0`, `Error size is 0`.
+- Spotless: 25 Java files clean, pom clean.
+- `target/ck-aws.hpi` generated.
+
+### Local boot verification — `mvn hpi:run -Dport=8081`
+
+- "Jenkins is fully up and running" (Jenkins 2.479.2); startup log free of
+  SEVERE/exception/load-failure entries.
+- `ck-aws` → `active: true`, `enabled: true`,
+  `requiredCoreVersion: 2.479.2`, version `1.0-SNAPSHOT (private-16c86596-radhika)`.
+- All **13** plugins active and enabled; zero inactive/disabled.
+- Snippet Generator (`/jenkins/pipeline-syntax/`) lists
+  **`ckAwsAssumeRole: Assume an AWS role for this build`** — step still registered.
+- Stopped cleanly by `kill -TERM` on the JVM holding port 8081 (per Session 5's
+  finding that `pkill -f "hpi:run"` leaves the forked JVM running).
+
+### Final artifact
+
+| | |
+|---|---|
+| Path | `target/ck-aws.hpi` |
+| Size | 27,712 bytes (27 KB) |
+| Built | 2026-08-03 16:14:26 +0530 |
+| Short-Name / Long-Name | `ck-aws` / CK AWS Plugin |
+| Plugin-Version | `1.0-SNAPSHOT (private-16c86596-radhika)` |
+| Jenkins-Version | 2.479.2 |
+| Build-Jdk-Spec | 21 |
+
+### Documentation changes made this session
+
+- **README.md — updated.** It was the one genuinely stale document: it still
+  advertised the M4 `awsProfile` / `validateIdentity` system properties and the
+  `verifyIdentity` / `temporaryProfileEnvironment` methods that M5 deleted, and
+  its status line still read M4. Now: status M5, a Usage section (step, log
+  output, runtime requirements, known limitations, the one surviving system
+  property), an install section, a corrected live-validation summary, and the
+  `docs/` entry in the project layout.
+- **docs/DEVELOPER_GUIDE.md — one paragraph updated.** Its §12 note flagged the
+  README as stale; that note now records the correction instead of pointing at a
+  problem that no longer exists.
+- **MEMORY.md — updated.** Sessions 6 and 7 added (M5 had never been recorded).
+- **CLAUDE.md — not modified.** No architectural decision changed: the auth
+  design, the AWS-service-agnostic executor rule, the `jk-<job>-<build>`
+  convention, the no-`~/.aws/config` rule and the JCasC/RunListener plans are all
+  exactly as documented. This session only removed nothing and added nothing.
+
+### Open items carried forward (unchanged by this session)
+
+- **Artifact version is `1.0-SNAPSHOT`, a private build.** Fine for a first
+  manual install; a real release version is a decision for whoever owns the
+  release process (still out of POC scope).
+- **BOM/2.479.3 decision** for the Platform team (Session 4).
+- **CloudTrail eyeballing** from Session 5 is still the one manual confirmation
+  step, if it has not been done.
+- Controller-JVM execution, no retry/timeout, no credential refresh, no generic
+  `ckAws.run([...])` step, no RunListener, no JCasC mapping.

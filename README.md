@@ -4,13 +4,17 @@ A Jenkins plugin (proof of concept) that centralizes AWS authentication and
 generic AWS CLI execution for deployment pipelines, so deployment Groovy no
 longer performs STS calls directly.
 
-**Status: M4 — the `ckAwsAssumeRole` pipeline step performs STS AssumeRole with
-the `jk-<job>-<build>` session-name convention, via a generic process executor.
-Generic AWS CLI execution (`ckAws.run([...])`), retry/timeout, and the
-RunListener/JCasC paths are not implemented.**
+**Status: M5 (production packaging) — complete. The `ckAwsAssumeRole` pipeline
+step performs STS AssumeRole with the `jk-<job>-<build>` session-name
+convention, via a generic process executor, and has been validated against real
+AWS. The temporary M4 validation surface has been removed; `target/ck-aws.hpi`
+is the installable artifact. Generic AWS CLI execution (`ckAws.run([...])`),
+retry/timeout, and the RunListener/JCasC paths are not implemented.**
 
-See [CLAUDE.md](CLAUDE.md) for the architecture and milestone plan, and
-[MEMORY.md](MEMORY.md) for session-by-session progress.
+See [CLAUDE.md](CLAUDE.md) for the architecture and milestone plan,
+[MEMORY.md](MEMORY.md) for session-by-session progress, and
+[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for a full walkthrough of the
+codebase.
 
 ## Requirements
 
@@ -56,47 +60,77 @@ Expect `"active": true` and `"requiredCoreVersion": "2.479.2"`.
 The same assertion runs headlessly as part of `mvn verify` — see
 `PluginLoadsTest`.
 
-## Live AWS validation (M4) — temporary, remove in M5
+## Usage
 
-Two system properties exist **only** to validate the plugin against a real AWS
-account from a local `hpi:run` Jenkins. They are invisible to the Pipeline DSL —
-the step's API is unchanged — and both are meant to be deleted in M5, together
-with the `verifyIdentity` / `temporaryProfileEnvironment` methods in
-`CkAwsAssumeRoleStep`.
+The plugin contributes one Pipeline step. It returns the generated session name
+and nothing else — no credential material reaches the Pipeline DSL.
+
+```groovy
+def session = ckAwsAssumeRole(roleArn: 'arn:aws:iam::123456789012:role/non_prod')
+// session == 'jk-<job>-<build>'
+```
+
+The build log shows:
+
+```
+[ck-aws] Assuming role arn:aws:iam::123456789012:role/non_prod as session jk-myjob-123
+[ck-aws] Assumed role  arn:aws:iam::123456789012:role/non_prod as session jk-myjob-123
+```
+
+CloudTrail in the target account records that same `jk-<job>-<build>` session
+name on the `AssumeRole` event — the point of the whole plugin.
+
+The step is available in the Snippet Generator as **"Assume an AWS role for this
+build"**.
+
+### Requirements at run time
+
+- The `aws` CLI must be on the controller's `PATH`.
+- A base identity the controller can use to call `sts:AssumeRole` (instance
+  role, `AWS_PROFILE`, etc.) must be resolvable from the controller's ambient
+  environment, and a region must resolve. The plugin does **not** read
+  `~/.aws/config`; the AWS CLI resolves both itself.
+- The target role's trust policy must permit that base identity.
+
+### Known limitations (POC)
+
+- The AssumeRole subprocess runs on the **Jenkins controller JVM**, not on the
+  agent selected by an enclosing `node` block.
+- Credentials are not exported to subsequent steps — that is a future
+  block-scoped `withProfile { }` step.
+- No retry, no timeout, no credential caching/refresh. Chained sessions are
+  capped at 1 hour.
+- Profile→role ARN mapping is not implemented; the ARN is passed explicitly.
+
+### System properties
 
 | Property | Effect |
 |---|---|
-| `io.github.rads4.ckaws.awsProfile` | Sets `AWS_PROFILE` on the AssumeRole child process, selecting the base identity. Unset ⇒ plain environment inheritance, as before. |
-| `io.github.rads4.ckaws.validateIdentity` | When `true`, verifies the issued credentials with one `sts get-caller-identity` call. Off by default. |
+| `io.github.rads4.ckaws.awsExecutable` | Overrides the `aws` executable used for the AssumeRole call. A test hook (the child inherits the JVM environment, so tests cannot prepend to `PATH` in-process). Defaults to `aws`. |
 
-Neither property reads `~/.aws/config` — the plugin only names a profile and
-the AWS CLI resolves it.
+## Installing the built plugin
 
 ```bash
-# the base profile's SAML session must be live
-aws sts get-caller-identity --profile ops-admin
-
-AWS_DEFAULT_REGION=us-east-1 mvn hpi:run -Dport=8081 \
-  -Dio.github.rads4.ckaws.awsProfile=ops-admin \
-  -Dio.github.rads4.ckaws.validateIdentity=true
+mvn clean verify        # produces target/ck-aws.hpi
 ```
 
-Then run a pipeline job containing only:
+Install `target/ck-aws.hpi` via **Manage Jenkins → Plugins → Advanced settings →
+Deploy Plugin**, then restart Jenkins. The target Jenkins must be 2.479.2 or
+newer.
 
-```groovy
-ckAwsAssumeRole(roleArn: 'arn:aws:iam::685502069032:role/ck-jenkins-plugin-validation-role')
-```
+## Live AWS validation
 
-A validation run makes **exactly two** AWS calls, both read-only:
-`sts:AssumeRole` and `sts:GetCallerIdentity`.
+The full stack was validated against real AWS from a local `hpi:run` Jenkins:
+AssumeRole succeeded and `sts get-caller-identity`, called with the issued
+temporary credentials, returned an ARN ending in
+`assumed-role/<role>/jk-<job>-<build>` — confirming the session-name convention
+survives real STS and is build-scoped. Exactly two read-only AWS APIs were
+exercised: `sts:AssumeRole` and `sts:GetCallerIdentity`. See
+[MEMORY.md](MEMORY.md) (Session 5) for the evidence.
 
-> **Why `AWS_DEFAULT_REGION` is set explicitly.** The identity check runs with
-> `AWS_PROFILE` removed — otherwise the CLI could answer from the base profile
-> and the check would prove nothing — which also drops that profile's region.
-> The CLI then falls back to the `default` profile's region, so without an
-> explicit `AWS_DEFAULT_REGION` the two calls can land in *different* regions,
-> and CloudTrail Event History is per-region. No region is defaulted in code: if
-> none can be resolved, the CLI's own error is surfaced and the build fails.
+The temporary system properties used to drive that validation
+(`io.github.rads4.ckaws.awsProfile`, `io.github.rads4.ckaws.validateIdentity`)
+and their supporting code were **removed in M5** and no longer exist.
 
 ## Project layout
 
@@ -108,6 +142,7 @@ src/main/java/io/github/rads4/ckaws/exec/        generic process executor (no AW
 src/main/java/io/github/rads4/ckaws/steps/       the ckAwsAssumeRole pipeline step
 src/main/resources/index.jelly                   description shown in Manage Plugins
 src/test/java/io/github/rads4/ckaws/             tests
+docs/DEVELOPER_GUIDE.md                          codebase walkthrough for new maintainers
 ```
 
 ## Notes on deviations from the archetype
