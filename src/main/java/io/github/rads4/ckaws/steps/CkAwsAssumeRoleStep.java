@@ -22,7 +22,14 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 
 /**
- * Pipeline step {@code ckAwsAssumeRole}: the plugin's Jenkins integration point.
+ * Pipeline step {@code ckAwsAssumeRole}: the original M2/M3 Jenkins integration point.
+ *
+ * <p><b>Superseded by {@link CkAwsWithProfileStep} ({@code ckAwsWithProfile}), and scheduled for
+ * removal.</b> Two reasons, both architectural rather than cosmetic: it discards the credentials it
+ * obtains, so nothing downstream can use them; and it executes on the Jenkins controller, so it
+ * authenticates with the controller's identity rather than that of the agent which would do the work.
+ * It is retained unchanged only because it is the step the live-AWS and CloudTrail validation was
+ * performed with, and removing it would invalidate that evidence. Do not build on it.
  *
  * <pre>{@code
  * def session = ckAwsAssumeRole(roleArn: 'arn:aws:iam::123456789012:role/non_prod')

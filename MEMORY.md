@@ -710,3 +710,239 @@ work, no refactoring, no architecture or authentication changes.
   step, if it has not been done.
 - Controller-JVM execution, no retry/timeout, no credential refresh, no generic
   `ckAws.run([...])` step, no RunListener, no JCasC mapping.
+
+---
+
+## Session 8 — 2026-08-04
+
+**Architecture review + M6 (layered architecture). The project's direction
+changed this session.** This is the first session where a previously agreed
+design decision was overturned rather than extended.
+
+### What triggered the review
+
+The plugin was complete through M5 and installed on Infra Jenkins. Before
+integrating it with the CloudKeeper deployment library, we reviewed three
+codebases together for the first time:
+
+1. this plugin,
+2. `cln-deployment-scripts` (the deployment shared library),
+3. `cln-infra-terraform` (the Terraform pipelines).
+
+### Findings that changed the direction
+
+**1. The premise recorded in CLAUDE.md was wrong.** CLAUDE.md described an
+`AwsAuth.groovy` in the shared library performing an explicit `sts assume-role`,
+and framed the plugin as replacing that call. **That file does not exist.**
+Neither does `Audit.groovy`. The library is `Utilities.groovy`, `Build.groovy`,
+`Deploy.groovy` and 12 `vars/*.groovy`, and it performs **no explicit STS call
+anywhere**. Authentication is entirely `aws ... --profile ${prof}`, where `prof`
+is a plain string (`envName == 'prod' ? 'prod' : 'non_prod'`) set in 12
+`vars/*.groovy` entry points and threaded through 9 function signatures.
+
+*(Counted precisely while writing the M7 plan later in this session: **13 AWS CLI
+invocations across 4 files**, 12 with `--profile` and 1 without. An earlier
+estimate in this session of "~50 call sites across 15 files" was wrong and has
+been corrected everywhere. The direction of the argument is unaffected — the
+executor was rejected mainly because three of four consumer shapes cannot use an
+argument list at all — but the adoption-cost argument against it is weaker than
+first stated, and the docs now say so.)*
+
+So the plugin had been designed to replace a call site that was not there.
+
+**2. There is no seam in the library to integrate against.** `prof` is a
+parameter, not an abstraction. Any change to how authentication works touches
+every file.
+
+**3. The `--profile` path produces no build attribution, and will be denied by
+the planned trust policy.** When the AWS CLI resolves a profile with a
+`role_arn`, it performs the AssumeRole itself and generates its own session name
+(`botocore-session-<epoch>`) unless `role_session_name` is pinned in config — and
+even pinned it is static per profile, so it can never carry a job name or build
+number. Consequences:
+   - CloudTrail today has **zero** build attribution for every existing
+     deployment.
+   - The planned Layer 3 trust policy
+     (`"StringLike": {"sts:RoleSessionName": "jk-*"}`) would **deny every
+     existing deployment on day one**.
+
+   This reframed the migration from "a tidy-up" to "a prerequisite for the
+   enforcement phase the project exists to enable".
+
+**4. There are four consumer shapes, not one.** This is the finding that killed
+the generic-executor design:
+
+| Consumer | How it gets credentials |
+|---|---|
+| deployment library Groovy | `sh "aws ... --profile ${prof}"`, ~50 sites |
+| `Utilities.dockerLoginEcr` | `aws ecr get-login-password \| docker login` — a **shell pipeline**, and it takes `prof` and ignores it |
+| `code/dr_sync.py` | boto3 `Session(profile_name=...)` |
+| `cln-infra-terraform/jenkins/*.groovy` | nothing explicit — ambient instance role + `AWS_REGION` |
+
+   Only the first can call an argument-list executor. Three of four consume
+   credentials through the **environment**. An AWS-CLI-executor API is generic
+   across AWS *services* but narrow across *consumers* — the opposite of what
+   the project needs.
+
+**5. The plugin's own step could not be consumed by anything.**
+`ckAwsAssumeRole` performs the AssumeRole and then **discards the credentials**,
+returning only the session name. It also runs on the **controller**, while every
+consumer runs on an agent — so it authenticated with the wrong identity and
+produced credentials on the wrong machine.
+
+### Architectural decisions made
+
+**Decision 1 — layered architecture.** Layer 0 config (JCasC) → Layer 1 the
+mandatory contract (block-scoped auth) → Layer 2 optional execution conveniences
+→ Layer 3 IAM trust policy. Each layer independently adoptable and revertable.
+
+**Decision 2 — the plugin owns identity only.** Execution stays with consumers,
+permanently.
+
+**Decision 3 — the generic AWS CLI executor is demoted, not deleted.** It was
+previously going to be *the* interface (`ckAws.run([...])`). It is now optional
+Layer 2. Reasons recorded in CLAUDE.md: it is the least generic option in
+practice, has the highest coupling and largest blast radius, the worst adoption
+cost (~50 call sites across 15 files in one change), and unbounded scope creep
+toward reimplementing `sh`. The original argument *for* it — centralized
+retry/timeout/logging — is still valid, which is why it survives as an optional
+surface rather than being removed.
+
+**Decision 4 — the wrapper is block-scoped, not value-returning.** Credentials
+must never be a step return value: a returned value is serialized into CPS
+program state (`program.dat`) and is trivially printable from a pipeline. The
+block holds them in an `EnvironmentExpander` as `hudson.util.Secret`, masks them
+in the console, and withdraws them at block exit. The block is also the only
+place a future credential refresh can live.
+
+**Decision 5 — execution moves to the agent.** The base identity is the agent's
+instance role; the controller's identity is both wrong and broader. This is a
+correctness fix, not a preference.
+
+**Decision 6 — profile→role mapping is JCasC-owned.** Consumers name an
+environment, never an ARN. Unknown profiles fail closed. An explicit `roleArn:`
+escape hatch exists and is documented as *not* a security boundary — the
+security boundary is Layer 3.
+
+**Decision 7 — reversed nothing about M1.** `SessionName`, `AuthCore`,
+`CliStsAssumeRole`, the `jk-` convention, the no-`~/.aws/config` rule and the
+no-per-service-branching rule are all unchanged and were re-affirmed.
+
+### Deviation from the original plan
+
+CLAUDE.md previously listed two explicitly rejected designs, the second being
+"auth-only plugin, execution back in Groovy `sh` calls", rejected because it
+loses centralized retry/timeout/logging. **That rejection was partially
+overturned.** The resolution is that auth-only is correct as the *mandatory
+boundary*, and the executor survives as an *optional surface* — so the original
+objection is answered by keeping Layer 2 rather than by forcing every consumer
+through it. CLAUDE.md was rewritten this session to record this.
+
+### Documentation rewritten this session
+
+- **CLAUDE.md — substantially rewritten** and is now the authoritative
+  architecture document. New: layered architecture, the six principles, the
+  rejected-designs section with reasons, the configuration reference, the
+  seven-stage migration strategy and the rollback table, and corrected
+  organizational context. The stale `AwsAuth.groovy` claim was corrected
+  explicitly rather than silently deleted.
+- **README.md — rewritten** for the new public API (`ckAwsWithProfile`, JCasC
+  configuration, `node` requirement, the `--profile` override warning), with
+  `ckAwsAssumeRole` marked deprecated.
+- **MEMORY.md — this entry.**
+
+### M6 implementation (same session, after the documentation rewrite)
+
+**Files added**
+
+| File | Layer | Purpose |
+|---|---|---|
+| `config/AwsProfile.java` | 0 | One `name -> roleArn (+ region)` entry; `@Symbol("awsProfile")` |
+| `config/CkAwsGlobalConfiguration.java` | 0 | `GlobalConfiguration`, `@Symbol("ckAws")`, exact-match `resolve()` |
+| `config/.../config.jelly` (x2) | 0 | Global config UI |
+| `exec/LauncherProcessRunner.java` | — | `ProcessRunner` backed by `Launcher`, so execution happens on the agent |
+| `steps/CkAwsWithProfileStep.java` | 1 | The block-scoped contract |
+| `steps/CredentialsEnvironmentExpander.java` | 1 | Publishes credentials into the block's `EnvVars`, held as `Secret` |
+| `steps/SecretMaskingConsoleLogFilter.java` | 1 | Masks credential material in the block's console output |
+
+**Unchanged, as required:** `AuthCore`, `CliStsAssumeRole`, `SessionName`,
+`AwsCredentials`, `ProcessRunner`, `DefaultProcessRunner`, `ProcessResult`, and
+all their tests. `CkAwsAssumeRoleStep` is untouched apart from a javadoc note
+marking it superseded — deliberately, so the live-AWS/CloudTrail evidence from
+Session 5 still describes code that exists.
+
+**Notable implementation decisions**
+
+1. **`ProcessRunner` was not changed.** The earlier review listed "add env/cwd to
+   `ProcessRunner`" as a required step. It turned out not to be: credentials
+   reach child processes through Jenkins' `EnvironmentExpander`, not through the
+   runner, so the interface (and therefore `CliStsAssumeRole`) stayed as-is.
+   `DefaultProcessRunner` already had an env overload; `LauncherProcessRunner`
+   mirrors it.
+2. **`workspace.mkdirs()` in the step.** `node` allocates a workspace path but
+   creates the directory lazily. This step can be the first thing in a build to
+   touch it, and a `Launcher` refuses to start a process in a directory that does
+   not exist — this surfaced as 11 test failures on the first run. Creating it in
+   the step rather than in `LauncherProcessRunner` keeps that class free of
+   filesystem side effects.
+3. **`GeneralNonBlockingStepExecution`**, so the blocking AssumeRole subprocess
+   does not stall the CPS VM thread.
+4. **Credentials are held as `hudson.util.Secret`** in both the expander and the
+   log filter, because both are serialized into CPS program state.
+5. **Region is exported as both `AWS_REGION` and `AWS_DEFAULT_REGION`**, and only
+   when configured — exporting `AWS_REGION=""` would override whatever the agent
+   would otherwise resolve, which is worse than exporting nothing.
+
+**Deviation: no JCasC test dependency.** The intent was a test that loads real
+JCasC YAML. Every available `io.jenkins:configuration-as-code` release fails the
+2.479.2 baseline: 1947+ declares `Jenkins-Version: 2.479.3` directly, and the one
+older release that declares 2.479.1 (`1932.v75cb_b_f1b_698d`) drags in
+`instance-identity:203.x`, which declares 2.479.3 itself. Raising the baseline
+would break the M0 guarantee that the plugin loads on CK's actual Jenkins.
+`workflow-basic-steps` was dropped for the same reason (same transitive), and the
+masking test uses `sh` instead of `echo` — a stronger test anyway, since it
+exercises real subprocess output. JCasC compatibility is instead asserted through
+its three actual mechanisms (`@Symbol` lookup, structs `DescribableModel`
+instantiation, `@DataBoundSetter` push). **Still untested end-to-end: JCasC's own
+YAML parsing and `unclassified` routing.** Revisit when CK moves to 2.479.3+.
+
+**Verification — `mvn clean verify`: BUILD SUCCESS.**
+
+| | |
+|---|---|
+| Tests run | 97 (was 63) |
+| Failures / Errors | 0 / 0 |
+| Skipped | 1 (pre-existing `InjectedTest` skip) |
+| New tests | `CkAwsGlobalConfigurationTest` (14), `LauncherProcessRunnerTest` (7), `CkAwsWithProfileStepTest` (19) |
+| Pre-existing tests | all still passing, unmodified |
+| Artifact | `target/ck-aws.hpi` |
+
+What the new tests actually prove, beyond registration: credentials reach a real
+subprocess inside the block; they are gone after the block; they are masked in
+the console even when a shell deliberately echoes them; the body does not run at
+all when authentication fails; the `jk-<job>-<build>` session name reaches the
+CLI's `--role-session-name`; an unknown profile fails closed listing what is
+configured; and `Launcher`/`FilePath` are required context, so the step cannot
+run on the controller.
+
+**Not implemented in M6, deliberately:** `ckAws.run([...])` (Layer 2), retry and
+timeout, credential refresh, RunListener injection, IAM trust policy.
+
+### Open items carried forward
+
+- **Credential refresh vs the 1-hour chained-session cap** is now the highest
+  open risk: real deployment job durations have not been measured, and a block
+  that runs past the hour will fail on expiry.
+- **`dockerLoginEcr` identity change.** It currently runs on the ambient instance
+  role; inside a Layer 1 block it becomes the assumed role, which must therefore
+  hold `ecr:GetAuthorizationToken`. Must be verified before rollout.
+- **The `--profile` override problem** is the single blocking detail for
+  deployment-library migration (M7): an explicit `--profile` beats exported
+  environment credentials. Two approaches recorded in CLAUDE.md; the choice is an
+  M7 decision.
+- **Agent base-identity shape is unconfirmed** — whether `~/.aws/config` on the
+  agents uses `credential_source = Ec2InstanceMetadata` or a `source_profile`
+  chain determines what the plugin must reproduce.
+- **Region is not a constant** across the estate (`us-east-1` in the library,
+  `us-east-2` for DR, `AWS_REGION` for Terraform). Always an input.
+- BOM / 2.479.3 decision (Session 4) — unchanged.

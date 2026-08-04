@@ -1,0 +1,10 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+  <f:section title="CK AWS">
+    <f:entry
+        title="AWS profiles"
+        description="Maps a profile name that pipelines ask for to the role the build should assume. Pipelines never name an ARN.">
+      <f:repeatableProperty field="profiles" add="Add profile" minimum="0"/>
+    </f:entry>
+  </f:section>
+</j:jelly>

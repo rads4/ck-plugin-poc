@@ -66,10 +66,16 @@
       <artifactId>workflow-step-api</artifactId>
     </dependency>
     <!--
-      Test-only: the minimum needed to define and run a Pipeline job in JenkinsRule tests. Deliberately
-      NOT workflow-basic-steps or workflow-durable-task-step - the step needs no 'node' block, and tests
-      assert the step's return value with plain Groovy rather than 'echo', which keeps the dependency
-      set small enough to stay within the 2.479.2 baseline (see the BOM comment above).
+      Test-only: enough to define and run a Pipeline job in JenkinsRule tests.
+
+      workflow-durable-task-step was added in M6, because ckAwsWithProfile requires Launcher/FilePath
+      context - i.e. it only runs inside a 'node' block, so the tests must be able to open one and run
+      'sh' inside it. Its version comes from the BOM above, so the 2.479.2 baseline still holds.
+
+      Deliberately NOT workflow-basic-steps (which would provide 'echo'): it drags in
+      instance-identity 203.x, which declares Jenkins-Version 2.479.3 and would raise this plugin's
+      baseline above CK production 2.479.2. Tests print with 'sh' instead - which is a stronger console
+      masking test anyway, since it exercises real subprocess output rather than Jenkins' own logger.
     -->
     <dependency>
       <groupId>org.jenkins-ci.plugins.workflow</groupId>
@@ -78,9 +84,26 @@
     </dependency>
     <dependency>
       <groupId>org.jenkins-ci.plugins.workflow</groupId>
+      <artifactId>workflow-durable-task-step</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.jenkins-ci.plugins.workflow</groupId>
       <artifactId>workflow-job</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      NOT added: io.jenkins:configuration-as-code (test scope), which would let a test load a real JCasC
+      YAML document. Every available version drags in BOM-managed transitives (instance-identity 203.x,
+      and JCasC itself from 1947 onwards) that declare Jenkins-Version 2.479.3 - which would raise this
+      plugin's baseline above CK production 2.479.2 and break the M0 loadability guarantee.
+
+      The plugin has no compile-time dependency on JCasC and does not need one: JCasC configures any
+      GlobalConfiguration through @Symbol + @DataBoundSetter + structs' DescribableModel. That is
+      exactly the surface CkAwsGlobalConfigurationTest asserts against, using structs directly (already
+      on the classpath) - the same mechanism JCasC would use, minus the baseline conflict. Revisit once
+      CK moves to 2.479.3+, together with the BOM pin above.
+    -->
   </dependencies>
 
   <repositories>
