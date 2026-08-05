@@ -946,3 +946,195 @@ timeout, credential refresh, RunListener injection, IAM trust policy.
 - **Region is not a constant** across the estate (`us-east-1` in the library,
   `us-east-2` for DR, `AWS_REGION` for Terraform). Always an input.
 - BOM / 2.479.3 decision (Session 4) — unchanged.
+
+---
+
+## Session 9 — 2026-08-05
+
+**Plugin validation and Infra Jenkins deployment.** The first session after M7
+(deployment-library integration, done in `cln-deployment-scripts` on branch
+`ck-aws-plugin`, commit `b36c7925`). No plugin source, tests, `pom.xml`, version
+numbers or manifests were changed in this session — the implementation was
+treated as frozen throughout.
+
+### Local validation completed
+
+- Plugin built successfully.
+- Local Jenkins (`mvn hpi:run`) validation completed successfully.
+- Verified `ckAwsWithProfile` execution.
+- Verified session naming format: `jk-<job>-<build>`.
+- Verified temporary credentials are injected **only inside the block**.
+- Verified cleanup after the block.
+- Verified STS AssumeRole succeeds.
+- Verified `aws sts get-caller-identity` returns the assumed role.
+- Verified CloudTrail attribution using the validation role.
+
+Evidence — job `ckaws-sts-validation`, builds #7 and #8, both SUCCESS:
+
+```
+[ck-aws] Assuming role arn:aws:iam::685502069032:role/ck-jenkins-plugin-validation-role as session jk-ckaws-sts-validation-8
+[ck-aws] Credentials available as session jk-ckaws-sts-validation-8 (expires 2026-08-05T06:54:42Z)
++ aws sts get-caller-identity
+    "UserId": "AROAZ7GY3PEUKA3CDG6XM:jk-ckaws-sts-validation-8",
+    "Account": "685502069032",
+    "Arn": "arn:aws:sts::685502069032:assumed-role/ck-jenkins-plugin-validation-role/jk-ckaws-sts-validation-8"
+[ck-aws] Released credentials for session jk-ckaws-sts-validation-8
++ echo after: token=[<unset>] session=[<unset>]
+```
+
+Two consecutive builds produced `jk-ckaws-sts-validation-7` and `-8`, confirming
+the session name is **build-scoped**, not merely well-formed. The
+`after: token=[<unset>] session=[<unset>]` line is the scope-exit proof: the
+credentials do not survive the block. Session expiry ≈ 1 hour, consistent with
+the known role-chaining cap.
+
+Exactly two AWS APIs were exercised: `sts:AssumeRole` and
+`sts:GetCallerIdentity`. No ECS, ECR or SSM calls were made, and no AWS resource
+was created or modified.
+
+### CloudTrail verification
+
+Verified that CloudTrail records `GetCallerIdentity` under:
+
+```
+arn:aws:sts::<account>:assumed-role/ck-jenkins-plugin-validation-role/jk-<job>-<build>
+```
+
+concretely, in account `685502069032` (the same ops account used in Session 5).
+
+The standardized session name appears correctly in CloudTrail.
+
+This confirms that the plugin is generating deterministic build-scoped session
+names and that AWS API calls are attributed to the **assumed role** instead of
+the base Jenkins identity.
+
+The correlation that matters: the `requestParameters.roleSessionName` on the
+`AssumeRole` event equals the session suffix in the `userIdentity.arn` of the
+`GetCallerIdentity` event, and that event's
+`sessionContext.sessionIssuer.arn` is the validation role rather than
+`CKPrism-AdministratorAccess` — proving the identity actually switched rather
+than falling through to the base credentials.
+
+### Issues encountered and resolved (both environmental, neither a plugin defect)
+
+**1. Local Jenkins silently executed nothing.** A Declarative pipeline
+(`pipeline { agent any … }`) produced only `Start of Pipeline` → `End of
+Pipeline` → SUCCESS, with no `node`, no `stage`, no body.
+
+Root cause: `pipeline-model-definition` is not installed in the `hpi:run`
+instance, so `pipeline` is **not a step** — but it *is* a registered `@Symbol`,
+owned by `WorkflowJob$DescriptorImpl` (workflow-job), the marker JCasC/Job DSL
+use to declare a Pipeline *job type*. The call therefore never reaches the
+"No such DSL method" path that a genuinely unknown name hits; it resolves as a
+describable symbol, the closure is consumed as configuration rather than executed,
+nothing runs and nothing throws. A control job using `someUndefinedStep { }`
+failed loudly with `NoSuchMethodError`, which is what made the distinction
+visible.
+
+Resolution: use **scripted** syntax locally. Declarative cannot be added at the
+2.479.2 baseline — installing it via the update centre upgraded the whole
+workflow stack past the baseline (`workflow-cps` → needs 2.504.3, `workflow-api`
+→ 2.504.1, `structs`/`script-security` → 2.479.3) and knocked out every plugin
+including `ck-aws`. The instance was restored by deleting the gitignored
+`work/plugins` and letting `hpi:run` re-provision its own 15 dependencies.
+`pipeline-stage-step 322.vecffa_99f371c` (manifest verified as requiring core
+2.479.1) was then added by file copy to provide `stage`. This is the same
+2.479.2-baseline trap recorded in Session 8 for JCasC — it is now confirmed to
+apply to the local dev environment as well.
+
+**2. `aws sts assume-role` failed with "Your session has expired."** while
+`ck-prism credential-process --profile ops-admin` succeeded standalone (exit 0,
+no stderr).
+
+Root cause: `[profile ops-admin]` in `~/.aws/config` carries **both**
+`login_session` and `credential_process`. `aws-cli/2.35.1` supports the newer
+`aws login` command and resolves `login_session` **first**, treating the profile
+as an `aws login` session profile, finding no valid session in
+`~/.aws/login/cache/`, and failing — `credential_process` is never invoked. The
+error text is the AWS CLI's own (note it says `aws login`, not `ck-prism login`).
+
+Proven by single-variable control: the identical profile with `login_session`
+removed returns the correct base identity; with it present, it fails. Ruled out
+by evidence: all AWS credential/config environment variables were **unset**;
+`aws` is the real CLI binary, not a wrapper; `~/.aws/credentials` has no
+`[ops-admin]` section; and the plugin's `LauncherProcessRunner` subprocess was
+verified to inherit its environment correctly. The failure reproduces in a plain
+shell with no Jenkins involved.
+
+`~/.aws/config` was rewritten at 10:28 on 2026-08-05, matching the ck-prism token
+cache mtime — a ck-prism-written annotation has collided with a newer AWS CLI
+feature. `ops-admin` is the only profile carrying both keys; `ops-read` and
+`prod-read` are unaffected. **This will affect every ck-prism user once their CLI
+reaches ≥ 2.3x and is worth raising with whoever owns ck-prism.**
+
+Resolution for validation only: `AWS_CONFIG_FILE` pointed at
+`work/aws-config-validation` (gitignored), a copy of the profile without
+`login_session`. `~/.aws/config`, `~/.aws/credentials` and `~/.ck-prism/` were
+**not** modified.
+
+### Release build
+
+`mvn clean verify` from a clean working tree, `main` @ `5c1b5bb`:
+
+| | |
+|---|---|
+| Result | **BUILD SUCCESS** |
+| Tests | 97 run, 0 failures, 0 errors, 1 skipped (pre-existing archetype `InjectedTest`) |
+| Artifact | `target/ck-aws.hpi` |
+| Size | 49,690 bytes (M5 was 27,712) |
+| SHA256 | `9f6dcf3038d43dee429ee6f8ebf6701e278717588f9852320d456502afd0a63b` |
+| Plugin-Version | `1.0-SNAPSHOT (private-5c1b5bbe-radhika)` |
+| Short-Name / Long-Name | `ck-aws` / CK AWS Plugin |
+| Jenkins-Version | 2.479.2 |
+| Build-Jdk-Spec | 21 |
+| Plugin-Dependencies | `workflow-step-api:700.v6e45cb_a_5a_a_21` |
+
+Plugin identity confirmed **unchanged** from the installed M5 build (commit
+`16c8659`, version marker `private-16c86596-radhika`): `groupId`, `artifactId`,
+`packaging` and `name` are byte-identical, so this installs as an in-place
+upgrade of `$JENKINS_HOME/plugins/ck-aws.jpi` rather than as a second plugin.
+The only pom difference is a **test-scoped** `workflow-durable-task-step`
+dependency, which is not packaged.
+
+### Infra Jenkins
+
+The updated plugin (`.hpi`) has been uploaded to Infrastructure Jenkins.
+
+It is currently **pending Jenkins restart** before becoming active.
+
+No further plugin code changes are planned.
+
+### Remaining validation
+
+Next milestone is deployment-library integration testing. After Jenkins restart:
+
+- execute one Backend deployment in **dev2**
+- validate ECR authentication
+- validate SSM access
+- validate ECS deployment
+- verify CloudTrail attribution for **all** deployment AWS API calls
+- if successful, continue rollout across remaining deployment types
+
+Carry forward into that test (from Sessions 7–8, still unverified):
+
+- `dockerLoginEcr` changes identity under a Layer 1 block — the assumed role must
+  hold `ecr:GetAuthorizationToken`. Most likely cause of a first-run failure.
+- The 1-hour chained-session cap with no refresh; real deployment duration has
+  still not been measured.
+- The M7 `AwsAuth.profileGuard` shell prelude fails **safe**, so a run that only
+  shows success cannot distinguish "plugin worked" from "silently took the legacy
+  `--profile` path". The `set -x` trace must show `CK_AWS_PROFILE=` **empty**
+  inside the block, and `--profile <prof>` outside it, or the test proves nothing.
+
+### Current status
+
+| Item | State |
+|---|---|
+| Plugin implementation | complete |
+| Local validation | complete |
+| STS validation | complete |
+| CloudTrail validation | complete |
+| Plugin uploaded to Infra Jenkins | complete |
+| Infra Jenkins restart | pending |
+| Backend deployment validation | pending |
+| Deployment library rollout | pending |

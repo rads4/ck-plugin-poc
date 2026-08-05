@@ -27,8 +27,9 @@ project.**
 | M3 — real pipeline on local Jenkins, real AWS, CloudTrail verified | Complete |
 | M4 — live AWS validation of the AssumeRole flow | Complete |
 | M5 — production packaging, installed on Infra Jenkins | Complete |
-| **M6 — layered architecture: block-scoped auth, JCasC mapping, agent-side execution** | **Current** |
-| M7 — deployment-library integration (plan only; not yet approved) | Planned |
+| M6 — layered architecture: block-scoped auth, JCasC mapping, agent-side execution | Complete |
+| M7 — deployment-library integration (`cln-deployment-scripts` @ `ck-aws-plugin`) | Complete, untested end to end |
+| **M7v — validation: local, STS and CloudTrail verified; `.hpi` uploaded to Infra Jenkins** | **Current — pending Jenkins restart, then Backend dev2 deployment** |
 | M8 — optional `ckAws.run([...])` convenience executor | Planned, optional |
 | M9 — RunListener default injection | Planned |
 | M10 — IAM trust-policy enforcement | Future, outside Jenkins |
