@@ -82,11 +82,127 @@ class CkAwsGlobalConfigurationTest {
     }
 
     @Test
-    void halfConfiguredProfilesAreTreatedAsAbsent(JenkinsRule j) {
-        CkAwsGlobalConfiguration configuration = configureWith(profile("no_arn", "", null), profile("", ROLE, null));
+    void aNamelessProfileIsTreatedAsAbsent(JenkinsRule j) {
+        CkAwsGlobalConfiguration configuration = configureWith(profile("", ROLE, null));
 
-        assertTrue(configuration.resolve("no_arn").isEmpty(), "a profile without a role ARN must not resolve");
+        assertTrue(configuration.configuredProfileNames().isEmpty(), "an entry with no name is unusable");
+    }
+
+    @Test
+    void anInstanceProfileModeEntryIsUsableWithoutARoleArn(JenkinsRule j) {
+        // Changed at M11. Managed Authentication must render such a profile so that 'aws --profile ops'
+        // keeps working in the same-account case, where there is nothing to assume: an *unknown* profile
+        // is a hard error in the AWS SDKs, whereas a known profile with no credential keys correctly
+        // falls through to the agent's own identity. The block step refuses it explicitly instead.
+        AwsProfile ops = new AwsProfile("ops", null);
+        ops.setMode(AwsProfile.INSTANCE_PROFILE);
+        CkAwsGlobalConfiguration configuration = configureWith(ops);
+
+        assertTrue(configuration.resolve("ops").isPresent());
+        assertFalse(configuration.resolve("ops").get().hasRole());
+        assertEquals(List.of("ops"), configuration.configuredProfileNames());
+    }
+
+    @Test
+    void anAssumeRoleEntryWithoutAnArnIsExcludedRatherThanDowngraded(JenkinsRule j) {
+        // The mode is declared, not inferred. An administrator who clears the ARN of an assume-role
+        // profile has broken it — and the build must be told, not quietly moved onto the agent's
+        // identity, which is the exact failure this plugin exists to prevent.
+        CkAwsGlobalConfiguration configuration = configureWith(profile("non_prod", "", null));
+
         assertTrue(configuration.configuredProfileNames().isEmpty());
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                j.jenkins
+                        .getDescriptorByType(AwsProfile.DescriptorImpl.class)
+                        .doCheckRoleArn("", AwsProfile.ASSUME_ROLE)
+                        .kind);
+    }
+
+    @Test
+    void theModeSurvivesAFormRoundTripAndDefaultsToAssumeRole(JenkinsRule j) throws Exception {
+        AwsProfile ops = new AwsProfile("ops", null);
+        ops.setMode(AwsProfile.INSTANCE_PROFILE);
+        configureWith(profile("non_prod", ROLE, null), ops);
+
+        j.configRoundtrip();
+
+        List<AwsProfile> reloaded = CkAwsGlobalConfiguration.get().getProfiles();
+        assertEquals(2, reloaded.size());
+        assertEquals(AwsProfile.ASSUME_ROLE, reloaded.get(0).getMode());
+        assertEquals(AwsProfile.INSTANCE_PROFILE, reloaded.get(1).getMode());
+    }
+
+    @Test
+    void configurationSavedBeforeTheModeExistedIsTreatedAsAssumeRole(JenkinsRule j) throws Exception {
+        // The upgrade path: profiles persisted by the installed M6 build carry no mode at all, and every
+        // one of them was an assume-role profile. Absence must therefore mean assume-role.
+        Map<String, Object> yamlWithoutMode = new LinkedHashMap<>();
+        yamlWithoutMode.put("name", "non_prod");
+        yamlWithoutMode.put("roleArn", ROLE);
+
+        AwsProfile bound = DescribableModel.of(AwsProfile.class).instantiate(yamlWithoutMode);
+
+        assertEquals(AwsProfile.ASSUME_ROLE, bound.getMode());
+        assertTrue(bound.hasRole());
+        assertTrue(bound.isUsable());
+    }
+
+    @Test
+    void profileNamesThatCouldInjectIntoTheGeneratedConfigAreRejected(JenkinsRule j) {
+        // A profile name becomes an INI section header, so a bracket or newline could introduce
+        // arbitrary keys; whitespace is rejected because the AWS config parser cannot read it at all.
+        CkAwsGlobalConfiguration configuration =
+                configureWith(profile("with space", ROLE, null), profile("bad]\n[profile prod", ROLE, null));
+
+        assertTrue(configuration.configuredProfileNames().isEmpty());
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                j.jenkins.getDescriptorByType(AwsProfile.DescriptorImpl.class).doCheckName("with space").kind);
+    }
+
+    // --- the Managed Authentication switches ----------------------------------
+
+    @Test
+    void managedAuthenticationIsOffByDefault(JenkinsRule j) {
+        CkAwsGlobalConfiguration configuration = CkAwsGlobalConfiguration.get();
+        assertNotNull(configuration);
+
+        // Installing or upgrading the plugin must change no build's behaviour until an administrator
+        // opts in. This is also what makes rollback a checkbox rather than a Jenkins restart.
+        assertFalse(configuration.isManagedAuthentication());
+        assertFalse(configuration.appliesTo("any/job"));
+        assertEquals(CkAwsGlobalConfiguration.DEFAULT_CREDENTIAL_SOURCE, configuration.getCredentialSource());
+    }
+
+    @Test
+    void theJobPatternSelectsWhichJobsAreManaged(JenkinsRule j) {
+        CkAwsGlobalConfiguration configuration = configureWith(profile("non_prod", ROLE, null));
+        configuration.setManagedAuthentication(true);
+
+        assertTrue(configuration.appliesTo("anything"), "a blank pattern means every job");
+
+        configuration.setJobNamePattern("uat/.*");
+        assertTrue(configuration.appliesTo("uat/Backend/deploy"));
+        assertFalse(configuration.appliesTo("prod/Backend/deploy"));
+
+        // A typo must narrow a rollout, never silently widen it to the whole controller.
+        configuration.setJobNamePattern("uat/[");
+        assertFalse(configuration.appliesTo("uat/Backend/deploy"));
+    }
+
+    @Test
+    void theCredentialSourceIsConstrainedToWhatAwsAccepts(JenkinsRule j) {
+        CkAwsGlobalConfiguration configuration = CkAwsGlobalConfiguration.get();
+        assertNotNull(configuration);
+
+        configuration.setCredentialSource("EcsContainer");
+        assertEquals("EcsContainer", configuration.getCredentialSource());
+
+        // Anything botocore would reject falls back to the default rather than producing a file the
+        // AWS SDKs refuse to parse.
+        configuration.setCredentialSource("NotAThing");
+        assertEquals(CkAwsGlobalConfiguration.DEFAULT_CREDENTIAL_SOURCE, configuration.getCredentialSource());
     }
 
     @Test
@@ -210,10 +326,25 @@ class CkAwsGlobalConfigurationTest {
         assertEquals(FormValidation.Kind.ERROR, descriptor.doCheckName("").kind);
         assertEquals(FormValidation.Kind.OK, descriptor.doCheckName("non_prod").kind);
 
-        assertEquals(FormValidation.Kind.ERROR, descriptor.doCheckRoleArn("  ").kind);
+        // Changed at M11: whether an ARN is required depends on the declared mode.
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                descriptor.doCheckRoleArn("  ", AwsProfile.ASSUME_ROLE).kind,
+                "assume-role mode has nothing to assume without an ARN");
+        assertEquals(
+                FormValidation.Kind.OK,
+                descriptor.doCheckRoleArn("  ", AwsProfile.INSTANCE_PROFILE).kind,
+                "instance-profile mode does not need one");
+        assertEquals(
+                FormValidation.Kind.WARNING,
+                descriptor.doCheckRoleArn(ROLE, AwsProfile.INSTANCE_PROFILE).kind,
+                "an ARN left behind after switching mode is ignored, and the admin should be told");
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                descriptor.doCheckRoleArn(ROLE + "\ncredential_process = x", AwsProfile.ASSUME_ROLE).kind);
         // Advisory, not an error: unanticipated ARN shapes must not be rejected by this plugin.
-        assertEquals(FormValidation.Kind.WARNING, descriptor.doCheckRoleArn("non_prod").kind);
-        assertEquals(FormValidation.Kind.OK, descriptor.doCheckRoleArn(ROLE).kind);
+        assertEquals(FormValidation.Kind.WARNING, descriptor.doCheckRoleArn("non_prod", AwsProfile.ASSUME_ROLE).kind);
+        assertEquals(FormValidation.Kind.OK, descriptor.doCheckRoleArn(ROLE, AwsProfile.ASSUME_ROLE).kind);
     }
 
     @Test
@@ -238,6 +369,7 @@ class CkAwsGlobalConfigurationTest {
 
     private static AwsProfile profile(String name, String roleArn, String region) {
         AwsProfile profile = new AwsProfile(name, roleArn);
+        profile.setMode(AwsProfile.ASSUME_ROLE);
         profile.setRegion(region);
         return profile;
     }

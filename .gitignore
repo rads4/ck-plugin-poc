@@ -13,3 +13,9 @@ work
 .settings
 .classpath
 .project
+
+# Session archive: full conversation transcript, infrastructure inventory and raw
+# evidence from the jenkins-node-inspect session. Contains AWS account IDs, role
+# ARNs, node configurations and internal hostnames. THIS REPOSITORY IS PUBLIC —
+# never commit anything from here.
+.session-archive/

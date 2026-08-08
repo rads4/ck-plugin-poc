@@ -274,6 +274,14 @@ public final class CkAwsWithProfileStep extends Step {
                         + "or as code under unclassified.ckAws.profiles.");
             }
             AwsProfile awsProfile = resolved.get();
+            if (!awsProfile.hasRole()) {
+                // A profile with no role ARN means "use the agent's own identity" — a legitimate
+                // configuration for Managed Authentication, but nothing this step can assume. Refusing
+                // is better than silently running as the agent under a name that implies otherwise.
+                throw new AbortException("The AWS profile '" + profile + "' has no role ARN configured, so "
+                        + "there is nothing for ckAwsWithProfile to assume. Configure a role ARN under "
+                        + "Manage Jenkins > System > CK AWS, or pass roleArn: explicitly.");
+            }
             return new Target(awsProfile.getRoleArn(), region != null ? region : awsProfile.getRegion());
         }
 

@@ -1138,3 +1138,1193 @@ Carry forward into that test (from Sessions 7–8, still unverified):
 | Infra Jenkins restart | pending |
 | Backend deployment validation | pending |
 | Deployment library rollout | pending |
+
+---
+
+## Session 10 — 2026-08-06
+
+**Architecture review only. No code was written, no plugin source, test, `pom.xml`,
+version number or manifest was touched.** Documentation was updated at the end, on
+explicit instruction.
+
+> **Session 9's closing line — "No further plugin code changes are planned" — is
+> superseded.** The wrapper is validated and correct; the *requirement* changed.
+
+### What changed
+
+Between Sessions 9 and 10 the wrapper completed its validation: Infra Jenkins
+deployment, Backend UAT deployment, and CloudTrail attribution across ECS, SSM,
+KMS, ECR, Docker login, Docker push, `RegisterTaskDefinition` and `UpdateService`.
+Technically finished.
+
+The requirement then changed to: **deployment repositories, Jenkinsfiles, shared
+libraries, shell scripts, Python, Terraform and `aws` CLI usage must all remain
+exactly as they are today.** The plugin must adapt to the ecosystem, not the other
+way round. `ckAwsWithProfile` cannot satisfy that — it is opt-in by construction,
+so it can be forgotten.
+
+"Non-bypassable" was also clarified by the user to mean **no accidental bypass**
+(nothing a developer must remember), *not* protection against hostile scripts or
+administrators. That materially narrowed the problem and removed OIDC from the
+critical path.
+
+### Decision: M11 — ambient authentication
+
+> *Renamed to **Managed Authentication** in Session 11, and the file location was
+> reversed. This entry is kept as written; see Session 11 for what changed.*
+
+Jenkins generates a **per-build AWS config file** and injects it into every
+Pipeline step via `DynamicContext.Typed<EnvironmentExpander>`. The file is the one
+the agents already have, plus a single line:
+`role_session_name = jk-<job>-<build>`. Every AWS tool then performs its own
+AssumeRole, natively, under the Jenkins-chosen identity.
+
+Full design: [docs/MANAGED_AUTHENTICATION_DESIGN.md](docs/MANAGED_AUTHENTICATION_DESIGN.md)
+(18 sections — lifecycles, failure modes, class design, compatibility matrix,
+proofs). Decision and rationale: CLAUDE.md, "M11 — ambient authentication".
+
+### Evidence gathered this session
+
+Everything below was measured or read from bytecode. Nothing was assumed. No AWS
+API call was made at any point; the credential tests used fabricated values in a
+scratch directory, and `~/.aws/config`, `~/.aws/credentials` and `~/.ck-prism/`
+were not read or modified.
+
+**1. An explicitly passed profile deletes the environment provider.**
+`botocore/credentials.py:95` — `disable_env_vars = session.instance_variables()
+.get('profile') is not None`, then `providers.remove(env_provider)`. Measured
+against `aws-cli 2.35.1` / `botocore 1.42.65`:
+
+| Invocation | Credentials resolved from |
+|---|---|
+| `aws --profile X …` | **config file** — environment ignored |
+| `aws …` | environment |
+| `AWS_PROFILE=X aws …` | environment |
+| `boto3.Session(profile_name="X")` | **config file** |
+| `boto3.Session()` | environment |
+
+This is the fact the whole design turns on: 12 of the 13 AWS invocations in the
+deployment library pass `--profile`, so exported environment credentials can never
+reach them — which is precisely why M7 needed `profileGuard`, i.e. a repository
+change.
+
+**2. `AWS_ROLE_SESSION_NAME` cannot substitute for the file.** The tempting
+minimal design ("leave `~/.aws/config` alone, inject one variable") is dead: that
+variable belongs only to `AssumeRoleWithWebIdentityProvider._CONFIG_TO_ENV_VAR`
+(`credentials.py:1879-1886`), the OIDC path. The provider the agents use reads
+`role_session_name` from the config file only (`:1643`, `:1693`, `:1956`), and
+without it botocore generates `botocore-session-<epoch>` (`:824`).
+
+*Corollary worth keeping:* under a future OIDC design the variable **is**
+honoured, so the file-generation layer disappears entirely.
+
+**3. `role_session_name` in a generated file is not "static per profile".**
+Earlier documentation stated that pinning `role_session_name` can never carry a
+job name or build number. True of an admin-written file; false of a per-build
+generated one. That single observation is what makes the architecture possible.
+
+**4. Other measurements**, all with fabricated credentials:
+
+- One `credential_process` invocation **per `aws` process** (3 commands → 3
+  invocations) — which is why the native `role_arn` form was chosen over it; the
+  AWS CLI caches assume-role results in `~/.aws/cli/cache` instead, giving one
+  AssumeRole per (build, profile).
+- A `credential_process` helper **inherits `AWS_CONFIG_FILE`** — a real recursion
+  hazard for that design, and another reason it lost.
+- An unknown profile fails **loudly**: exit 253,
+  `The config profile (X) could not be found`.
+- With **no `[default]`** in the generated file, an unprofiled command falls
+  through to IMDS and behaves exactly as today — no hard error. This is what makes
+  "start without a default" a provable no-op for `dockerLoginEcr` and Terraform.
+- `credential_source` accepts `Ec2InstanceMetadata`, `EcsContainer` and
+  `Environment` (`credentials.py:1157`, `:2070`, `:1187`), so it can be a
+  configurable setting rather than a hardcoded EC2 assumption.
+
+**5. Jenkins internals, from bytecode at the pinned versions:**
+
+- `ContextVariableSet.get` (workflow-cps 4046) walks block-scoped `values` first,
+  then `ExtensionList.lookup(DynamicContext.class)` — so an explicit
+  `ckAwsWithProfile` still wins, and core already holds a `ThreadLocal`
+  re-entrancy guard. It does **not** cache `DynamicContext` results, so the
+  implementation must memoise.
+- `DynamicContext.Typed` is in `workflow-step-api:700.v6e45cb_a_5a_a_21` — already
+  a dependency. **No new dependency, no BOM movement, no 2.479.3 trap.**
+- `DefaultStepContext` (workflow-support 968) derives `Run`, `Job`, `Node`,
+  `Computer`, `Launcher`, `FilePath`, `EnvVars`, `TaskListener` and
+  `EnvironmentExpander`. `Node` is what makes the agent-root file location viable.
+- `WorkspaceList.tempDir(FilePath)` and `RunListener.onFinalized(R)` both exist in
+  core 2.479.2.
+- **`PluginManager.dynamicLoad` throws `RestartRequiredException` on the
+  "plugin is already installed" branch.** `PluginWrapper.supportsDynamicLoad()`
+  returns `MAYBE` when the `Support-Dynamic-Loading` manifest attribute is absent,
+  which it is in `target/ck-aws.hpi`. So: a *new* plugin id can be dynamically
+  loaded once, on first install; **every upgrade of any plugin requires a
+  restart**, and uninstalling requires one too.
+
+### Sub-decisions and why
+
+**Evolve `ck-aws`; do not create a second `ck-aws-platform` plugin.** A second
+plugin buys exactly one restart-free event (its first install), then guarantees a
+restart for every iteration, and adds one more at retirement — it postpones
+nothing. What actually removes restarts from the rollout is the **enable flag**:
+with ambient code shipped inert inside `ck-aws`, enabling and disabling it is a
+restart-free configuration change, which is faster rollback than uninstalling a
+second plugin could ever be. A fork would also mean either duplicating
+`CkAwsGlobalConfiguration` (two sources of truth for profiles, the exact thing
+Layer 0 exists to prevent) or duplicating `SessionName` (whose `jk-` shape is
+load-bearing for the future trust policy and must not be allowed to drift). For
+iteration speed the answer is not a second plugin — it is not deploying to Infra
+Jenkins until the design is stable; `mvn hpi:run` gives a full loop with zero
+production restarts.
+
+**Global configuration only.** Folder-scoped configuration
+(`AbstractFolderProperty`) was seriously considered — because a Pipeline's own
+Jenkinsfile rewrites its job property list, and all 12 CloudKeeper entry points
+declare `options { buildDiscarder(...) }`, so a UI-set *job* property can be
+silently deleted on the first build. A folder property is structurally immune.
+It was **dropped anyway**: the global mapping is sufficient and the user's
+requirement is explicitly "keep it simple, one configuration location".
+
+**File location: the agent root path**, not the workspace and not `@tmp`. An
+earlier draft proposed `WorkspaceList.tempDir(workspace)`; that was reversed
+because `cleanWs()` deletes `@tmp` siblings by default and `deleteDir()` /
+`git clean -fdx` reach the workspace — losing the file mid-build would silently
+return the build to the unattributed `--profile` path. The cost is that AWS calls
+inside containers are not covered.
+
+**Native `role_arn` + `credential_source`**, not `credential_process` and not
+static credentials. Reasons in evidence item 4 and the design document §2.2.
+
+### Corrections to earlier documentation, made this session
+
+- **The `hudson.util.Secret` / CPS-program-state claim was wrong and is now
+  corrected in CLAUDE.md.** `Secret` declares no `writeObject`/`writeReplace`, so
+  it is *not* encrypted under plain Java serialization; the wrapper's
+  `EnvironmentExpander` therefore does hold credential material in CPS program
+  state. This was found during the Session 8/9-era freeze review and had remained
+  uncorrected. M11 removes the exposure rather than restating the claim — the
+  ambient path puts no credentials in the environment at all.
+- The `credential_process`-on-the-agent direction and the folder-property
+  direction, both recorded in CLAUDE.md's earlier "Direction under investigation"
+  section, are now recorded as rejected with reasons rather than as preferred.
+  History was preserved, not deleted.
+
+### Limitations accepted before implementation
+
+1. **A profile name used by a repository but absent from the Jenkins mapping fails
+   the build.** Loud, never silently wrong, but a failure. Mitigation is a
+   pre-rollout inventory of every `--profile` string. Largest operational risk.
+2. AWS calls inside containers are not covered (file lives outside the workspace).
+3. Freestyle jobs are not covered — `DynamicContext` is Pipeline-only.
+4. Unprofiled calls are unattributed unless a `[default]` is configured;
+   provably a no-op until then.
+5. Controller-side AWS calls by other Jenkins plugins remain unattributed.
+6. AWS SDK for Java v1 `credential_source` support is limited — flagged, not
+   assumed.
+
+### Documentation changed this session
+
+| File | Change |
+|---|---|
+| `docs/MANAGED_AUTHENTICATION_DESIGN.md` | **New.** The 18-section implementation design |
+| `CLAUDE.md` | Status table (M11); the "Direction under investigation" section replaced by "M11 — ambient authentication"; Layer 1 supersession note refined to Layer 1A/1B; configuration reference gained the three new settings; migration Stages 1–5 marked historical and Stage 6 rewritten; 1-hour cap marked resolved for the ambient path; Definition of Done — M11 added; M6 DoD corrected re `Secret`; five new "What NOT to do" rules |
+| `README.md` | Status, a "Planned: ambient authentication" section, and the limitations list |
+| `MEMORY.md` | This entry |
+
+### Open questions blocking implementation
+
+1. Does Infra Jenkins run any **freestyle** job that calls AWS?
+2. Are the three new settings on the existing CK AWS page acceptable?
+3. Does any consumer run `aws`/boto3 **inside a container**?
+4. `[default]` profile — configure one now, or leave unset until Stage 5?
+   (Recommendation: leave unset.)
+
+### Current status
+
+| Item | State |
+|---|---|
+| Wrapper implementation (M6/M7) | complete and validated |
+| Backend UAT deployment via wrapper | complete |
+| M11 design | complete, awaiting approval |
+| M11 implementation | **not started — no code written** |
+| Pre-rollout profile-name inventory | not started |
+
+---
+
+## Session 11 — 2026-08-06
+
+**Final architecture review before implementation. No code written; no plugin
+source, test, `pom.xml`, version or manifest touched.** The task was explicitly to
+*try to disprove* the Session 10 design. It survived, with one reversal, four new
+findings and one rename.
+
+### Rename
+
+**"Ambient Authentication" → "Managed Authentication."** The name now describes
+behaviour rather than mechanism: the plugin *manages* AWS authentication for
+Jenkins builds. `docs/AMBIENT_AUTHENTICATION_DESIGN.md` was replaced by
+`docs/MANAGED_AUTHENTICATION_DESIGN.md`; Session 10 above is kept as written.
+
+*(The old file had also acquired a pasted copy of the previous prompt in its
+header; writing the renamed file resolved that.)*
+
+### Reversal — where the generated file lives
+
+Session 10 chose `<agent root>/ck-aws/<run>/`. **Reversed to
+`<workspace>@tmp/ck-aws/`** on three counts:
+
+1. **It eliminates the container limitation.** `docker.image().inside { }`,
+   Declarative `agent { docker }` and Kubernetes agents make the workspace and its
+   `@tmp` sibling visible inside the container; the agent root is not visible.
+   Session 10 listed containers as an accepted limitation; the user asked whether
+   it could be eliminated cleanly, and this is the clean elimination.
+2. **It bounds storage without relying on cleanup.** The path is stable per
+   workspace and overwritten every build, so the footprint is
+   `workspaces × ~1 KB` rather than `builds × 1 KB`. The orphan-sweeper
+   (`ComputerListener`) proposed in Session 10 was **deleted from the design** —
+   cleanup is now hygiene, not correctness.
+3. **Losing the file fails loudly.** Measured: `AWS_CONFIG_FILE` pointing at a
+   missing path plus `--profile X` exits **253**,
+   `The config profile (X) could not be found`. There is no silent fallback to an
+   unattributed identity, which is what makes the residual `cleanWs()` exposure
+   tolerable.
+
+`@tmp` is a *sibling* of the workspace, so `deleteDir()`, `git clean -fdx` and
+`stash` (workspace-rooted) cannot reach it. `cleanWs()` can — handled by verifying
+existence **once per `node` block**, keyed on the enclosing `ExecutorStep`
+FlowNode id, never per step.
+
+Also established: **no regression for containers either way.** A container has no
+`~/.aws/config` today, so no existing pipeline can be using `--profile` inside
+one; and an unprofiled call with `AWS_CONFIG_FILE` pointing at a path the
+container cannot see falls through to IMDS exactly as today (measured).
+
+### Execution-mode audit (the disproof attempt)
+
+The decisive enabling fact, from `ContextVariableSet` bytecode: `values` is
+`final`, `get()` **never writes to it**, and the only static state is a
+`ThreadLocal` re-entrancy guard. **Core never caches `DynamicContext` results** —
+they are recomputed on every query. That is why node changes, parallel branches
+and multi-agent builds resolve correctly rather than freezing a stale path.
+
+| Mode | Verdict |
+|---|---|
+| Shared libraries, `parallel`, `matrix`, `retry`, `timeout` | ✅ |
+| Multiple `node` blocks / multiple agents | ✅ — each gets its own file and its own exported path |
+| `input` (incl. across a controller restart) | ✅ — the memo is in-memory only, so a restart causes a rewrite |
+| `stash`/`unstash` | ✅ — `stash` is workspace-rooted; the config is a sibling and is never shipped |
+| `ws()`, `dir()` | ✅ |
+| Multibranch | ⚠️ — works, but see the truncation finding below |
+| `docker.image().inside{}`, `agent { docker }`, Kubernetes | ⚠️→✅ expected after the location change; mount behaviour is the one unverified claim |
+| Freestyle jobs | ❌ — `DynamicContext` is Pipeline-only |
+
+### New findings
+
+**1. Session-name collision in deep multibranch hierarchies.** `SessionName`
+truncates the middle (job) segment to stay within STS's 64 characters, so two
+branches sharing a long prefix produce the same `jk-<truncated>-<build>`. It is an
+attribution defect, not a security one, and it is **pre-existing since M1** —
+Managed Authentication merely makes it fleet-wide. Fixing it means appending a
+short deterministic hash on truncation, which changes a load-bearing convention,
+so it is recorded as **a separate decision, deliberately not folded into M11**.
+
+**2. Memo leak.** Because core does not cache `DynamicContext` results, the plugin
+must memoise — and that memo must be **evicted in `onFinalized`**, or it grows one
+entry per node block forever. Recorded as a hard implementation constraint, with a
+`WeakHashMap` keyed on `Run` as belt and braces.
+
+**3. INI injection.** The renderer interpolates admin-supplied profile names and
+role ARNs into an INI file; a value containing `\n`, `[` or `]` could inject
+arbitrary keys, including `credential_process`. Only administrators can configure
+profiles, so severity is low, but the fix is trivial and must be applied in **both**
+the form validation and the renderer, because JCasC bypasses form validation.
+
+**4. Profile names cannot contain whitespace.** Measured round trip through a
+generated file: `non_prod`, `prod`, `ops`, `sandbox`, `finance`, `engineering`,
+`qa`, `with-dash`, `with_underscore`, `with.dot`, `Mixed_Case9`, `with:colon` and
+`with/slash` all resolve; `with space` is **rejected by botocore's config parser**.
+Form validation must reject it. Genericity is otherwise confirmed — arbitrary
+organisation-chosen names work without plugin changes.
+
+### Performance and scalability, quantified
+
+Per build (1 node block, ~50 steps, 13 `aws` invocations, 1 profile):
+
+| | |
+|---|---|
+| `get()` on a memo hit | ~1 µs — one map lookup, no remoting |
+| `get()` on a memo miss | 3 remoting round trips (`exists`, `mkdirs`, `write`), once per node block |
+| Cleanup | 1 remoting round trip at finalize |
+| `sts:AssumeRole` | **1 per (build, profile)** — cached in `~/.aws/cli/cache`; boto3 does 1 per Python process |
+| Jenkins-side overhead | **≈ 5 ms per build** |
+| AWS-side overhead | one AssumeRole, ~150–400 ms, once |
+
+At 5,000 builds/day: **0.06 STS req/s** average (orders of magnitude below any AWS
+limit); +5,000 CloudTrail management events/day (free in the first trail);
+~200 live memo entries at 200 concurrent builds; agent disk bounded by workspace
+count. No timers, no thread pools, no sweeper.
+
+The one thing that would not scale — an `exists()` or a write **per step** — is
+explicitly designed out and recorded as implementation constraint #1.
+
+### Criteria tension surfaced
+
+"Existing infrastructure repositories require zero modifications" and "CloudTrail
+continues producing `jk-<job>-<build>`" **conflict for `cln-infra-terraform`**,
+which passes no profile at all. Attributing it without repository changes requires
+configuring a `[default]` profile, which simultaneously changes
+`Utilities.dockerLoginEcr`'s identity (needs `ecr:GetAuthorizationToken`). Both
+criteria cannot be met for that repository until that permission question is
+settled. Deferred to its own rollout stage; starting without a default is a
+provable no-op.
+
+### Unverified claims, recorded before implementation
+
+1. `docker.image().inside { }` mounts `<workspace>@tmp` and propagates the build
+   environment — docker-workflow is not a dependency, so its bytecode was not
+   inspected.
+2. Kubernetes agents share the workspace volume across pod containers.
+3. Terraform's AWS provider honours `AWS_CONFIG_FILE` + `role_arn` +
+   `credential_source`.
+4. `cleanWs()` deletes `@tmp` siblings (assumed as the worst case).
+5. JCasC end-to-end YAML load — a pre-existing M6 gap at the 2.479.2 baseline.
+
+### Documentation changed this session
+
+| File | Change |
+|---|---|
+| `docs/MANAGED_AUTHENTICATION_DESIGN.md` | **New**, replacing `AMBIENT_AUTHENTICATION_DESIGN.md`. 21 sections: adds the execution-mode audit, the container analysis, the location reversal, quantified performance and scalability, implementation constraints, unverified claims, and a Definition of Done |
+| `docs/AMBIENT_AUTHENTICATION_DESIGN.md` | **Deleted** (renamed) |
+| `CLAUDE.md` | M11 renamed to Managed Authentication; naming note; file-location reversal recorded with reasons; `ContextVariableSet`-never-caches fact added; limitations extended from 5 to 7; config field renamed `managedAuthentication`; pointers updated |
+| `README.md` | Section renamed; new file location; container coverage and bounded-footprint properties; limitations refreshed |
+| `MEMORY.md` | This entry, plus a forward pointer on Session 10 |
+
+### Current status
+
+| Item | State |
+|---|---|
+| M11 design | **finalized — implementation approved to begin** |
+| M11 implementation | not started — no code written |
+| Pre-rollout profile-name inventory (Stage 0) | not started |
+| Freestyle-job question | open |
+| Container-mount verification | open |
+| Session-name truncation decision | open, deliberately separate from M11 |
+
+---
+
+## Session 12 — 2026-08-06
+
+**M11 Managed Authentication implemented and validated locally against real AWS.**
+First session in which M11 code exists. Nothing was uploaded to Infrastructure
+Jenkins, committed or pushed.
+
+### Final decisions incorporated before coding
+
+Nine decisions were fixed before implementation and the design document was
+updated first, as instructed. Eight were already satisfied by the finalized
+design; **one changed the code**: a profile now declares an explicit
+**authentication mode** — `AssumeRole` (cross-account, attributed) or
+`InstanceProfile` (same-account, the agent's own identity) — rather than the
+plugin inferring it from whether a role ARN happened to be blank. Inference would
+turn a mistyped or cleared ARN into a silent downgrade to "no authentication",
+which is the exact failure the plugin exists to prevent. Declared, the same
+mistake is a form error.
+
+### What was built
+
+| File | Role |
+|---|---|
+| `managed/ManagedAwsFiles.java` | Pure renderer: the generated `config`, the empty `credentials`, and one helper script per assume-role profile. No Jenkins imports, so the file format is unit-tested without `JenkinsRule` |
+| `managed/ManagedAwsContext.java` | `DynamicContext.Typed<EnvironmentExpander>` — the injection point. Memoised per `(run, workspace)`; hot path is a map lookup with no I/O |
+| `managed/ManagedAwsAction.java` | Persisted bookkeeping of generated directories, so cleanup survives a controller restart |
+| `managed/ManagedCleanupListener.java` | `RunListener.onFinalized` — deletes the directory and evicts the memo, for every terminal build state |
+| `config/AwsProfile.java` | Gained `mode`; `hasRole()`/`isUsable()` are mode-driven; INI-injection validation on names and ARNs |
+| `config/CkAwsGlobalConfiguration.java` | Gained `managedAuthentication`, `jobNamePattern`, `credentialSource`; `configure()` override so a cleared field can actually be cleared |
+| `steps/CkAwsWithProfileStep.java` | Fails closed on an instance-profile-mode profile: there is nothing to assume |
+
+Version bumped `1.0` → `1.1`. Plugin id, short name and artifact identity
+unchanged, so this installs as an in-place upgrade.
+
+### How one AssumeRole per (Run, Profile) is achieved
+
+The generated `config` points each assume-role profile at a plugin-written helper
+via `credential_process`. The helper checks a workspace-private cache before
+calling STS, so the first AWS consumer in the build pays for the AssumeRole and
+every later one — any `aws` command, boto3 session, Terraform run or
+`docker login` — reuses the same session. The helper emits the exact
+`credential_process` JSON shape using the AWS CLI's own `--query`, so no `jq` is
+needed on the agent.
+
+It is also **lazy**: only profiles a build actually uses are ever assumed.
+Validated below — three profiles were configured in assume-role mode and only the
+one the pipeline referenced produced a session cache.
+
+### Build and test results
+
+`mvn clean verify` — **BUILD SUCCESS**. Tests **145**, failures 0, errors 0,
+skipped 1 (pre-existing archetype `InjectedTest`). SpotBugs `BugInstance size is
+0`; Spotless clean across 40 files. New: `ManagedAwsFilesTest` (21, plain JUnit),
+`ManagedAwsContextTest` (19, `@WithJenkins`); `CkAwsGlobalConfigurationTest` grew
+14 → 22.
+
+Two pre-existing assertions changed deliberately, each with a comment saying why:
+a blank role ARN is no longer unconditionally an error (it depends on the declared
+mode), and a role-less profile is now usable in instance-profile mode.
+
+### Local validation against real AWS
+
+Local Jenkins (`mvn hpi:run -Dport=8081`), plugin `1.1-SNAPSHOT` active. Four
+profiles configured through Manage Jenkins only: `ckvalidation`, `non_prod`,
+`prod` (assume-role) and `ops` (instance-profile). The pipeline was an **ordinary
+Jenkinsfile** — `node { sh 'aws sts get-caller-identity --profile ckvalidation' }`
+×3 — with no wrapper, no plugin step and no import.
+
+| Build | Flag | Session observed |
+|---|---|---|
+| #2 | **OFF** | `botocore-session-1786026256` — the zero-attribution status quo |
+| #4 | **ON** | `jk-ckaws-managed-validation-4` on all three calls |
+| #5 | **OFF** again | `botocore-session-1786026256` — identical to #2 |
+
+Verified:
+
+- **One AssumeRole per build**: the session cache mtime was identical after call 1
+  and after call 3 (`1786026666`), while all three calls returned the same
+  assumed-role ARN.
+- **Laziness**: only `.session-ckvalidation.json` was created. `non_prod` and
+  `prod` were configured and rendered but never assumed.
+- **Generated directory**: `<workspace>@tmp/ck-aws/`, mode `0700`, files `0600`.
+- **Cleanup**: the directory was **gone** after the build; the `@tmp` parent
+  remained empty. No sweeper, no timer.
+- **Instance-profile mode**: `[profile ops]` rendered with no credential keys, so
+  the AWS SDKs fall through to the agent's identity.
+- **Feature flag**: toggled ON and OFF **without restarting Jenkins**, and the
+  setting survived a restart.
+- **Backward compatibility**: with the flag off, `AWS_CONFIG_FILE` was the build's
+  own value, `CK_AWS_SESSION_NAME` was unset, no `[ck-aws]` line appeared in the
+  log, and no directory was generated.
+
+Only `sts:AssumeRole` and `sts:GetCallerIdentity` were exercised. No resource was
+created, updated or deleted; no ECS, SSM, ECR or IAM call was made.
+
+### Defect found and fixed during validation
+
+The first ON run failed with
+`InvalidClientTokenId ... The security token included in the request is invalid`.
+
+Root cause, established by dumping the generated helper rather than guessing: the
+helper restores the AWS environment so its inner `sts assume-role` resolves the
+agent's real base identity, and the plugin was reading that environment from
+`Run#getEnvironment(listener)`. **That is the build's environment — Jenkins
+variables, contributors, build parameters — not the operating-system environment a
+child process inherits.** It returned nothing, so the helper emitted `unset` for
+variables that were genuinely set, and the inner call authenticated as the wrong
+identity.
+
+Fixed by reading `Computer#getEnvironment()`, which is the agent process's own
+environment. Worth recording because on a real agent — where none of these
+variables are set — both sources look identical, so this would have shipped
+unnoticed and failed only on a machine with a base profile configured.
+
+### Open items carried forward
+
+- Container mounting (`docker.image().inside{}` mounting `@tmp`) is still
+  **unverified** — the design's one load-bearing unverified claim.
+- Freestyle jobs remain uncovered; whether Infra Jenkins has any that call AWS is
+  still an open question.
+- The pre-rollout inventory of every `--profile` name used across repositories has
+  **not** been done. It is the gating task before enabling the flag in production.
+- `[default]` profile still deliberately unset, so unprofiled calls
+  (`dockerLoginEcr`, Terraform) stay on today's behaviour.
+- Session-name truncation collision in deep multibranch hierarchies — a separate
+  decision, deliberately not folded into M11.
+
+### Current status
+
+| Item | State |
+|---|---|
+| M11 implementation | complete |
+| Unit + integration tests | 145 pass, 0 failures |
+| Local validation, real AWS, ON and OFF | complete |
+| One-AssumeRole-per-build proof | complete |
+| Cleanup proof | complete |
+| Upload to Infra Jenkins | **not done — awaiting approval** |
+| CloudTrail verification in Ops account | pending manual check |
+
+---
+
+## Session 13 — 2026-08-06
+
+**Architecture review only. No code written; no plugin source, test or `pom.xml`
+touched.** The requirement changed again after M11 was implemented and locally
+validated, and the review concluded that **M11 as built does not satisfy it.**
+
+### The requirement, restated
+
+Every AWS API call originating from Jenkins must become attributable in CloudTrail
+to the build — AWS CLI, boto3, Terraform, Docker ECR login, Java/Go/Python SDKs,
+shell scripts, shared libraries, existing repositories and future ones. The only
+intended behavioural difference is the session name. And explicitly: **the
+administrator will not enumerate or configure each repository's authentication
+path.** Some use profiles, some IMDS, some Terraform, some raw SDKs. Whatever a
+pipeline does today must keep working untouched and simply become attributed.
+
+### Answer: not fully achievable with a plugin alone, and the limitation is AWS
+
+Three facts, verified against the STS service model shipped with the AWS CLI and
+the botocore provider chain:
+
+1. **Only three AWS operations accept a caller-chosen session name:**
+   `AssumeRole` and `AssumeRoleWithWebIdentity` (`RoleSessionName`), and
+   `GetFederationToken` (`Name` — IAM users only, so unavailable to an instance
+   role). `GetSessionToken` has no name parameter. **Attribution is only ever a
+   by-product of assuming a role.**
+2. **An instance-role session's name is assigned by EC2 and is immutable**
+   (`assumed-role/<role>/i-<instance-id>`). There is no request in which a caller
+   could influence it.
+3. **So a build authenticating through IMDS cannot be attributed unless something
+   assumes a role for it — which requires a trust policy permitting it.** Trust
+   policies live in IAM, which a plugin cannot change.
+
+The limitation is **AWS (STS + EC2)** — not Jenkins, not the SDKs, not Terraform,
+not Docker.
+
+### Why M11 as implemented fails the requirement
+
+- **It requires enumeration.** It replaces `AWS_CONFIG_FILE` with a file built
+  only from the Jenkins mapping, so any profile name not configured in Jenkins
+  fails the build (`The config profile (X) could not be found`).
+- **It leaves IMDS pipelines unattributed** — they fall through to the instance
+  role exactly as today.
+
+Both were known and documented as limitations when M11 was designed; the change is
+that they are now disqualifying rather than acceptable.
+
+Nothing is wasted: the injection point, `<workspace>@tmp/ck-aws/`, the lifecycle,
+cleanup, the feature flag, the off-is-invisible property and one-AssumeRole-per-
+(Run, Profile) all carry forward. **Only the content of the generated file
+changes.**
+
+### The decision: M12 — overlay, do not replace
+
+- **Layer A — attribute what already exists, without naming any of it.** Copy the
+  agent's own AWS configuration into the build's private temp directory and inject
+  one line into every profile that assumes a role:
+  `role_session_name = jk-<job>-<build>`. `role_arn`, `source_profile`,
+  `credential_source`, region and MFA settings are copied verbatim — the
+  mechanism is preserved, only the label is added. No enumeration; a profile added
+  to an agent tomorrow is attributed on its next build.
+- **Layer B — attribute the unprofiled path.** A `[default]` that assumes the
+  agent's own role, discovered at runtime by one `sts:GetCallerIdentity` per agent
+  and cached. This is the layer that needs **one IAM trust-policy edit per
+  account** (self-assumption, or a same-permission companion role). Until that
+  edit exists the layer stays off and unprofiled calls behave exactly as today.
+- **Layer C — optional, later.** `AWS_CONTAINER_CREDENTIALS_FULL_URI`. Verified
+  from the botocore chain (`post_profile = [..., container_provider,
+  instance_metadata_provider]`): it outranks IMDS but loses to an explicit
+  profile. Catches clients that ignore shared config, at the cost of a local
+  credential endpoint. Not needed for v1.
+
+The Jenkins `profile → roleArn` mapping demotes from **source of truth** to
+**optional override**.
+
+### A founding rule is reversed, and it needs explicit agreement
+
+Since M6 the architecture has said **"the plugin must never read
+`~/.aws/config`"**, because the identity *decision* had to be Jenkins-owned. The
+M12 requirement inverts that premise: the agent's existing decision must be
+**preserved**, with Jenkins contributing only attribution — which cannot be done
+without reading the file.
+
+Recorded as a deliberate reversal with the trade-off stated: **Jenkins stops being
+the authority on which role a build assumes, and becomes the authority on how that
+assumption is labelled.** The old rule still governs the override path. This was
+flagged to the user rather than applied silently, and implementation is blocked on
+their agreement.
+
+### What remains unreachable, whatever is built
+
+1. Clients that pin a credential provider in code (e.g. an explicit
+   `InstanceProfileCredentialsProvider`).
+2. AWS calls inside containers with nothing mounted.
+3. Controller-side AWS calls by other Jenkins plugins.
+4. Deliberate bypass by someone with `sh` on an agent.
+
+Truly universal attribution needs per-build federated identity (OIDC /
+`AssumeRoleWithWebIdentity`) plus removing the instance-profile principal from
+those trust policies — an infrastructure programme, not a plugin.
+
+### Open items before M12 implementation
+
+- **Explicit agreement to reverse the no-read rule.** Blocking.
+- The IAM trust-policy edit for Layer B.
+- Role **path** is not recoverable from an assumed-role ARN
+  (`assumed-role/<name>/<session>` omits it), so runtime discovery of the agent's
+  role ARN needs `iam:GetRole`, or an administrator override where roles use
+  paths.
+- Whether AWS SDK for Java **v1** honours `role_session_name` from shared config.
+- Carried forward from Session 12, unchanged: container mounting unverified;
+  freestyle jobs uncovered.
+
+### Documentation updated this session
+
+`CLAUDE.md` (M12 section, status table, the rule reversal),
+`docs/MANAGED_AUTHENTICATION_DESIGN.md` (superseded-content banner naming which
+sections still apply), `README.md` (status and the M12 note), and this entry.
+Session 12 and earlier were left exactly as written.
+
+### Current status
+
+| Item | State |
+|---|---|
+| M11 implementation | complete, locally validated, **insufficient for M12** |
+| M11 artifact `ck-aws.hpi` 1.1-SNAPSHOT | built, **not uploaded** |
+| M12 design | agreed in principle |
+| M12 implementation | **not started — blocked on the no-read rule reversal** |
+| Infra Jenkins upload | not done |
+
+---
+
+## Session 14 — 2026-08-06
+
+**Architecture review only, refining M12. No code written.** Two questions were
+asked and both are answered affirmatively, with one AWS limitation restated
+precisely.
+
+### Question 1 — can both modes produce `jk-<job>-<build>`?
+
+Yes, but the mechanism is narrower than "obtain base credentials from IMDS, then
+create a managed session". Verified from the STS service model shipped with the
+AWS CLI:
+
+| Operation | Required input | Can carry a chosen name |
+|---|---|---|
+| `AssumeRole` | `RoleArn` **and** `RoleSessionName` | yes — a target role ARN is mandatory |
+| `GetFederationToken` | `Name` | **no** — AWS documents it as requiring *"the long-term security credentials of an IAM user"*, so an instance role cannot call it |
+| `GetSessionToken` | *(none)* | no name parameter exists |
+
+So **there is no way to mint a named session without assuming a role.** The two
+modes therefore differ in exactly one thing — where the *target* role ARN comes
+from. Base credentials are IMDS either way, because that is how the agent
+authenticates.
+
+| Mode | Target role | Permissions vs today | IAM change |
+|---|---|---|---|
+| `AssumeRole` | the configured ARN | those of the target role | none, if the trust already exists |
+| `InstanceProfile` | **the agent's own role** (self-assumption) | **identical** | **one trust-policy edit** |
+
+**The exact limitation is IAM, not Jenkins:** a role does not trust itself by
+default — an EC2 instance role's trust policy names `ec2.amazonaws.com` only — so
+self-assumption is denied until an administrator adds the role's own ARN as a
+principal. Whether a same-account self-assumption *also* needs `sts:AssumeRole` in
+the role's identity policy is recorded as must-verify rather than asserted.
+
+**This redefines `InstanceProfile` mode**, which M11 implemented as "render a
+profile with no credential keys, fall through, stay unattributed". From M12 it
+means "self-assume the agent's own role for attribution" — turning the mode from a
+documented gap into a solution.
+
+### Question 2 — can the plugin select the profile from job-name patterns?
+
+Yes, entirely Jenkins-side, and it is better than the runtime role discovery
+Session 13 proposed. An ordered `pattern -> profile` list matched against a job's
+full name, first match wins (`prod/.* -> prod`, `uat/.* -> non_prod`,
+`dev.* -> non_prod`, `ops/.* -> ops`).
+
+The selected profile becomes the `[default]` in the generated config — the
+identity for every AWS call that does **not** name a profile, which is exactly the
+gap (Terraform, `dockerLoginEcr`, raw SDKs, bare shell scripts). An explicit
+`--profile X` still resolves to X: a command-line flag is the pipeline stating an
+intent, and overriding it would change behaviour rather than label it.
+
+This replaces M11's single on/off `jobNamePattern`, which only gated; the rules
+both gate and select. It also removes the need for `iam:GetRole` and role-path
+reconstruction, since the administrator states the mapping once per folder.
+
+### Question 3 — jobs matching no rule
+
+Confirmed, and already the implemented behaviour: the plugin returns before
+touching anything — no environment variable, no file, no AWS call, no log line.
+Identical to the "switch off" and "no profiles configured" paths, which are
+covered by tests.
+
+### Does this give full attribution while preserving behaviour?
+
+| Job shape | Attributed | Behaviour preserved |
+|---|---|---|
+| Matched, `--profile X` where X assumes a role | yes | yes — identical role and permissions |
+| Matched, no profile, rule → `InstanceProfile` | yes | **yes — identical permissions** |
+| Matched, no profile, rule → `AssumeRole` | yes | **no — permissions become the target role's** |
+| Unmatched | no, unchanged | yes — untouched |
+| Client pinning a credential provider in code | no | yes |
+| AWS call in a container with nothing mounted | no | yes |
+
+The third row is the decision point. Mapping a folder that today runs on the bare
+instance role to `AssumeRole -> non_prod` attributes it with no IAM change, but its
+effective permissions change and it breaks if the instance role holds anything the
+target role does not. **`InstanceProfile` mode is the one that satisfies "exactly
+as they do today", at the cost of the trust-policy edit** — the irreducible price
+of attributing an IMDS identity.
+
+### Documentation updated
+
+`CLAUDE.md` (new "two authentication modes" section, Layer B rewritten around job
+rules, configuration reference, open items),
+`docs/MANAGED_AUTHENTICATION_DESIGN.md` (banner extended with the two
+refinements), and this entry. No source, tests or `pom.xml` touched.
+
+### Still blocking M12 implementation
+
+- Agreement to reverse the "never read `~/.aws/config`" rule (Session 13).
+- The IAM trust-policy edit for `InstanceProfile` mode, and confirmation of
+  whether an identity-policy grant is needed alongside it.
+- Which folders map to which profile, in which mode.
+
+---
+
+## Session 15 — 2026-08-06
+
+**M12 Managed Authentication implemented and validated against real AWS.** The
+plugin is now a *decorator*: it reads the executing node's own AWS configuration
+and adds a session name to it. It never decides identity.
+
+### Three defects found before or during implementation
+
+All three were found by testing, not by reasoning, and all three would have
+reached production.
+
+**1. Blanking `AWS_SHARED_CREDENTIALS_FILE` breaks `source_profile` chains.**
+Measured: exit 253, *"The source_profile 'base' referenced in the profile
+'chained' does not exist."* M11 did exactly this. M12 never touches the variable —
+under a decorator there is nothing to shadow, and leaving it alone also avoids
+copying static keys into the workspace.
+
+**2. A `[default]` profile with a `role_arn` is authoritative.** Measured: when its
+AssumeRole fails, the call exits non-zero rather than falling through to IMDS.
+**So a speculative self-assuming `[default]` would break every unprofiled call
+whose trust policy does not permit it** — the opposite of fail-safe. This is the
+technical reason M12 ships without IMDS self-assumption rather than attempting it
+optimistically.
+
+**3. A literal NUL byte in `ManagedAwsAction`'s separator.** Jenkins persists
+actions as XML, where `0x00` is not a legal character; every build logged
+*"Failed to serialize … #locations"* and no cleanup location survived. Fixed by
+modelling the pair as a nested `Location` type — removing the need to choose a
+safe delimiter rather than choosing one more carefully.
+
+### Implementation
+
+| File | Role |
+|---|---|
+| `managed/AwsConfigOverlay.java` | **New.** Pure line-based decoration. Never parses and regenerates |
+| `managed/ManagedAwsContext.java` | **Rewritten.** Discovers the node's config, decorates, writes, exports two non-secret variables |
+| `managed/ManagedAwsRecord.java` | **New.** Cleanup bookkeeping, split out of the hot path |
+| `managed/ManagedAwsAction.java` | Rewritten around a nested `Location` type |
+| `managed/ManagedAwsFiles.java` | **Deleted** — the credential_process helper approach is gone |
+
+The helper-script/`credential_process` design was removed deliberately. It
+*replaced* the node's authentication mechanism; the requirement is to *preserve*
+it. Native `role_arn` also works with AWS SDK for Java v1, which does not support
+`credential_process`. The trade-off accepted: several AssumeRole calls per build
+(one per process family) instead of exactly one — all under the same session name,
+so CloudTrail attribution is unaffected.
+
+Version `1.1` → `1.2`.
+
+### Validation
+
+`mvn clean verify` — **BUILD SUCCESS**, 138 tests, 0 failures, 1 skipped
+(pre-existing), SpotBugs 0, Spotless clean. New: `AwsConfigOverlayTest` (17, plain
+JUnit), `ManagedAwsContextTest` (16, rewritten).
+
+Local Jenkins, plugin `1.2-SNAPSHOT`, **zero profiles configured in Jenkins** — the
+node's config was the only source. Ordinary Jenkinsfile, no plugin references.
+
+| Build | Flag | Session observed |
+|---|---|---|
+| #1 | OFF | `botocore-session-1786036150`, node config untouched |
+| #2 | ON | **`jk-ckaws-m12-2`** on all three calls |
+| #3 | OFF again | `botocore-session-1786036150` — identical to #1 |
+
+The decorated file showed the node's config copied verbatim — comments, the
+`[profile ops-admin]` `credential_process` line, and `[profile ckvalidation]`'s
+`role_arn` / `source_profile` / `region` — **plus exactly one added line**. This
+run also exercised a `source_profile` chain, a different code path from the
+`credential_source` form the deployment agents use.
+
+Also verified: cleanup removed the directory; an unknown profile failed exactly as
+it does today (`The config profile (nosuch_profile) could not be found`) while
+decoration itself succeeded; ON/OFF toggled with no restart; no credentials
+exported; `AWS_SHARED_CREDENTIALS_FILE` left unset.
+
+### Not validated, and why
+
+**IMDS self-assumption is not implemented and could not be honestly validated.**
+There is no IMDS on a development machine, and `ck-jenkins-plugin-validation-role`
+trusts `CKPrism-AdministratorAccess` only (read-only `iam:GetRole`) — it cannot
+assume itself, and this project will not modify it. Combined with defect 2 above,
+attempting it speculatively would risk breaking builds. Documented as an AWS/IAM
+limitation.
+
+### Current status
+
+| Item | State |
+|---|---|
+| M12 implementation | complete |
+| Tests | 138 pass |
+| Local validation, real AWS, ON and OFF | complete |
+| IMDS attribution | **not implemented — AWS/IAM limitation** |
+| Upload to Infra Jenkins | **not done — awaiting approval** |
+
+---
+
+## Session 16 — 2026-08-06
+
+**Final production build.** One correctness defect found by review and fixed; the
+deployment-agent authentication shape reproduced faithfully and validated. No new
+features.
+
+### Defect: fail-open did not cover the whole contribution path
+
+Asked to confirm that *any* unexpected exception falls back without failing the
+build, the honest answer was no. The guard wrapped only `prepare()`, which left
+outside it:
+
+| Statement | Throws |
+|---|---|
+| `CkAwsGlobalConfiguration.get()` | `IllegalStateException` if Jenkins is unavailable |
+| `context.get(Run.class)` | `IOException` |
+| `context.get(FilePath.class)` | `IOException` |
+| `context.get(TaskListener.class)` | `IOException` |
+| `catch (Exception e)` | does not catch `Error` — `LinkageError`, `NoClassDefFoundError` |
+
+`DelegatedContext.get` is declared `throws IOException, InterruptedException` —
+confirmed from the interface bytecode, so these were real checked exceptions, not
+theoretical. Anything escaping propagates through `ContextVariableSet` into the
+step and **fails the build** — the one outcome the design forbids.
+
+**Fixed:** the entire contribution path now runs inside `ManagedAwsContext.guarded`,
+which catches `Throwable` and re-throws only `InterruptedException` (so an aborted
+build stays aborted). The outermost handler performs **no console I/O**, since it
+is reached in states where attempting it could itself throw; expected, diagnosable
+failures are still reported to the build log one level in.
+
+`Throwable` rather than `Exception` is deliberate: a classloading failure after an
+upgrade would otherwise break every step on the controller rather than one build.
+
+Six regression tests added (`ManagedAwsGuardTest`), including the two that matter:
+an `Error` contributes nothing, and an `InterruptedException` still propagates.
+
+### The deployment-agent shape, reproduced rather than assumed
+
+Session 15 validated a `source_profile` chain; the deployment agents use
+`credential_source = Ec2InstanceMetadata`, a different botocore code path. That gap
+was closed rather than argued away.
+
+`AWS_EC2_METADATA_SERVICE_ENDPOINT` is honoured by the SDK
+(`botocore/configprovider.py:85-87`), so a local IMDS stand-in and a local STS
+stand-in were used to exercise the real path with the agent's exact configuration.
+No real AWS calls; the stand-ins serve obviously fake values.
+
+| State | `uat-deploy2` | `prod-deploy2` |
+|---|---|---|
+| Flag OFF (post-upgrade state) | `botocore-session-1786037672` | `botocore-session-1786037672` |
+| Flag ON, pattern `uat-.*` | **`jk-uat-deploy2-2`** | `botocore-session-1786037672` — untouched |
+| Flag OFF again | `botocore-session-1786037672` | — |
+
+Matched and unmatched jobs, in the same instance at the same moment: one gains
+attribution, the other is byte-identical to today.
+
+### Two harness defects found and fixed along the way
+
+Worth recording because both initially looked like product defects:
+
+1. **The first fake STS answered `GetCallerIdentity` from the most recent
+   `AssumeRole` it had seen**, so a build that hit the AWS CLI's credential cache
+   reported someone else's session. Corrected to issue a unique access key per
+   assumption and answer from the credential actually presented.
+2. **A stale CLI cache entry masked a run.** Chasing it found
+   `botocore/credentials.py:833-838`: an *auto-generated* session name is stripped
+   from the assume-role cache key, while an *explicitly configured* one is kept.
+   This is a **good** property — it means each build's session name produces its own
+   cache entry and builds cannot inherit one another's session. Confirmed in
+   practice: consecutive builds produced `jk-agent-shape-5` and `-6`.
+
+### Build
+
+`mvn clean verify` — **BUILD SUCCESS**. Tests **144**, failures 0, errors 0,
+skipped 1 (pre-existing archetype `InjectedTest`). SpotBugs `BugInstance size is
+0`; Spotless clean across 42 files.
+
+| | |
+|---|---|
+| Artifact | `target/ck-aws.hpi`, 68,785 bytes |
+| Version | `1.2-SNAPSHOT (private-2288bd59-radhika)` |
+| SHA256 | `4372a254e2748341328aa1966766df771c4ca67544bbee7c4bec0b2f69f7d419` |
+| Plugin id | `ck-aws` — unchanged, in-place upgrade |
+
+### Still true, and carried forward
+
+- **IMDS-only pipelines gain nothing.** AWS limitation: a session name exists only
+  as a by-product of `AssumeRole`, and self-assumption needs a trust-policy edit.
+  Measured additionally: a `[default]` with a `role_arn` is authoritative — a failed
+  assumption is a hard error, not a fallback — so speculative self-assumption would
+  break builds. This is why the mode is absent rather than experimental.
+- Terraform declaring its own `assume_role {}` block, hardcoded credentials, pinned
+  credential providers, containers with nothing mounted, and freestyle jobs are all
+  out of reach.
+- **Not validated against a real multi-agent Infrastructure Jenkins** — all local
+  validation used a single-node instance.
+
+### Current status
+
+| Item | State |
+|---|---|
+| M12 implementation | complete |
+| Tests | 144 pass |
+| Fail-open across the whole path | complete, regression-tested |
+| Deployment-agent shape (`credential_source`) | validated |
+| Matched / unmatched behaviour | validated |
+| Upload to Infra Jenkins | **not done — awaiting approval** |
+
+---
+
+## Session 17 — 2026-08-07
+
+**Production incident investigation. Root cause NOT proven. No architecture
+change made.**
+
+### The report
+
+`uat/batchprocessor` #182 on `jenkins-slave-non-prod-multitenant`: with Managed
+Authentication ON, Gradle fails dependency resolution with **403 Forbidden** from
+the internal S3-backed Maven repository, and no `jk-uat-batchprocessor-182`
+appears in CloudTrail. The plugin logged a successful decoration from
+`/home/ubuntu/.aws/config`. With the flag OFF the same job succeeds.
+
+### What was proven locally, against the exact agent shape
+
+A local IMDS stand-in plus the documented slave configuration (`role_arn` +
+`credential_source = Ec2InstanceMetadata`, no `[default]`):
+
+| Consumer | OFF | ON |
+|---|---|---|
+| Unprofiled | `iam-role` (IMDS) | **`iam-role` (IMDS) — identical** |
+| `--profile non_prod` | `botocore-session-…` | `jk-uat-batchprocessor-182` |
+
+The diff between the node's file and the plugin's export is **two added
+`role_session_name` lines**. So for this shape the plugin **cannot** change what
+an unprofiled consumer receives — the leading hypothesis is eliminated.
+
+Also confirmed via the new diagnostics: `sections found = [profile non_prod,
+profile prod]`, both decorated, none appended, and
+`aws sts get-caller-identity --profile non_prod` returns `jk-diag3-1`. So the
+plugin is not decorating one profile while the build uses another.
+
+An incidental observation worth keeping: with no profile named, `aws configure
+list` reported `shared-credentials-file` as the source on a machine that has
+`~/.aws/credentials`. The plugin deliberately does not touch
+`AWS_SHARED_CREDENTIALS_FILE`, so that file remains fully in play — by design, and
+the reason `source_profile` chains keep working.
+
+### What could not be established
+
+Neither the AWS SDK for Java nor Gradle is installed on the development machine.
+**No claim is made about how Gradle resolves credentials.** Stating SDK v1
+behaviour from memory would be recall presented as evidence, which is precisely
+what the investigation was asked to avoid.
+
+### Open questions, each with a decisive discriminator
+
+1. Does `/home/ubuntu/.aws/config` contain a `[default]` section or any profile
+   beyond `non_prod`/`prod`? → the diagnostics line `sections found`.
+2. Is `AWS_PROFILE` set anywhere? → diagnostics prints the node's value; a
+   pipeline-set value needs `sh 'env | grep -i aws'` inside the failing job.
+3. How is Gradle's S3 repository authenticated? → the repository block in the
+   build script.
+4. **Which account's CloudTrail was searched?** `terraform-assume-role` for
+   non_prod lives in the non-prod account, and `AssumeRole` is recorded in the
+   account owning the role — not in ops. Searching ops would prove nothing.
+   (Account IDs are deliberately not in this repository; it is public.)
+
+### Change made this session
+
+Diagnostics only, behind `-Dio.github.rads4.ckaws.diagnostics=true` (off by
+default): `AwsConfigOverlay.describe()` now reports sections found, decorated and
+appended, and `ManagedAwsContext` prints those plus the node's AWS environment and
+the exported values. Non-sensitive throughout. 144 tests still pass.
+
+**No final HPI produced.** A diagnostic build exists at
+`sha256 359db9fdf489c653b5b9943bb2e022f4a4cfd6c4ce87f5f32e323a51585dc38d`.
+
+### Immediate mitigation available without any code change
+
+Set **Apply to jobs matching** to a pattern that excludes the affected job, or
+turn Managed Authentication OFF. Both are runtime configuration changes requiring
+no restart, and both restore today's behaviour exactly.
+
+---
+
+## Session 18 — 2026-08-07
+
+**Infra Jenkins fleet measured directly over SSM; plugin exonerated for the M12i incident.
+No code change.**
+
+Full write-up is **not tracked** — it contains AWS account IDs, role ARNs and a node
+inventory, and this repository is public. See `.session-archive/MEMORY-session-18.md`,
+`.session-archive/INFRA_JENKINS_FLEET_FACTS.md` and
+`.session-archive/M12i_RCA_AND_ROLLOUT.md`.
+
+Sanitized outcome and the agreed v2.0.0 scope: [docs/V2_DECISIONS.md](docs/V2_DECISIONS.md).
+
+---
+
+## Session 19 — 2026-08-07
+
+**v2.0 implemented. 180 tests, all green. `ck-aws 2.0` built.**
+
+### Shipped
+
+| Item | Where |
+|---|---|
+| Verify the generated file before exporting it | `AwsConfigOverlay.validate` |
+| `[default]` self-assume, attributing unprofiled calls | `AwsConfigOverlay`, new `unprofiledRoleArn` |
+| Diagnostics as a checkbox (system property kept as an override) | `CkAwsGlobalConfiguration` |
+| Exclude pattern; node-label scoping | `appliesTo`, new `appliesToNode` |
+| Both real agent shapes as fixtures | `ProductionShapeFixturesTest` |
+| Session name truncates the tail, not the head | `SessionName` |
+| Scope selection and the OFF-by-default guarantee | `ScopeSelectionTest` |
+
+### Two bugs found in this session's own work
+
+1. **An invalid include pattern briefly returned `true`** — widening scope to
+   every job on a typo, the one direction that must never fail. Introduced while
+   refactoring `appliesTo` to add exclude, caught by writing the test for it.
+   Fixed by separating "pattern absent" from "pattern unparseable" as distinct
+   fallbacks; both now pinned.
+2. A local variable named `jenkins` shadowed the `jenkins.model` package.
+
+### Decisions taken during implementation
+
+- **No IAM change is required.** Self-assume was measured working on a live host.
+- **Not a dedicated audit role**: resource policies grant by *principal ARN*, and
+  sampling found two buckets granting to the instance role by name, one
+  cross-account. A new role would be denied by all of them.
+- **`sts:SourceIdentity` deferred**: it requires `sts:SetSourceIdentity` on every
+  downstream role's trust policy, and would break the jobs that assume roles
+  directly — the ones it was meant to trace.
+- **No `credential_process`, no Layer C**: neither is needed once source identity
+  is deferred and the chaining cap is left to the SDK's own refresh.
+- Real account IDs replaced with placeholders in all test fixtures: the
+  repository is public.
+
+Rationale in full: [docs/V2_DECISIONS.md](docs/V2_DECISIONS.md) and CLAUDE.md
+"v2.0". Infrastructure evidence is in `.session-archive/` and is **not tracked**.
+
+### Not done, deliberately
+
+Rollout itself. The plan is one restart to install with the flag OFF, then a
+canary job scoped by include pattern, then widening by folder — all
+configuration, no further restarts.
+
+---
+
+## Session 20 — 2026-08-08
+
+**v2.0 installed, canaries run, three defects found and fixed. 199 tests.**
+
+### Installed, and what the canaries proved
+
+The slave canary passed exactly as designed: seven sections found, five
+decorated, none appended, `--profile` attributed, unprofiled untouched (the
+unprofiled role was deliberately left blank to isolate one variable).
+
+**The controller canary failed** — the safety check refused the generated file
+and the build ran unattributed, exactly as fail-open promises. Root cause: the
+controller's configuration **ends with a blank line**, and joining lines with
+`"\n"` turns a final empty element into a single terminating newline, so the
+trailing blank was lost whenever the last section was decorated. The check
+correctly saw a line present in the input and absent from the output. A real
+defect, for a difference that does not matter — trailing blank lines are not
+content. Now normalised on both sides, with a regression test for the shape.
+
+**This was the validate-before-export feature earning its place on its first
+real run.**
+
+### Three defects fixed
+
+1. **Trailing blank line** — above. Blocked the controller entirely.
+2. **A named profile with no `role_arn` was not attributed.** Same
+   unattributable path as `[default]`, reached by name instead of by omission;
+   otherwise a caller could opt out of the audit by naming it. Extended to any
+   profile section, with an explicit guard so non-profile sections
+   (`[sso-session x]`, `[services x]`) are never given a role.
+3. **Freestyle builds were not covered at all** — 35 of 775 buildable jobs,
+   including production S3 and Route 53. See CLAUDE.md "Freestyle builds"; the
+   important part is that `RunListener#setUpEnvironment` runs before the
+   workspace exists and fails *silently*.
+
+### Verification done without touching production
+
+The new overlay was run against **all eight real configurations** captured from
+the fleet — seven agents plus the controller, with and without unprofiled
+attribution. All pass, including the 3473-byte controller file that failed live
+and the agent that has no `[default]` at all. Only the controller has a trailing
+blank line, which is precisely why one canary passed and the other did not.
+
+New tests exercise a **real agent** rather than the built-in node, proving the
+generated file is written on the agent and not the controller — a distinction
+invisible on the built-in node, where a remote path is a local file.
+
+### Production left untouched
+
+Verified after the fact: no generated directories left in any workspace (the
+plugin's own cleanup), no temporary files, and `~/.aws/config` still carries its
+original mtime. Nothing was edited on any host at any point.
+
+---
+
+## Session 21 — 2026-08-08
+
+**`ck-aws 2.1` built. Six canary baselines captured before upgrading.**
+
+### Why 2.1 and not another 2.0
+
+Three different artifacts were built reporting `Plugin-Version: 2.0` as defects
+were found. "The controller says 2.0" therefore identified nothing. **Raise
+`<revision>` before producing any artifact that leaves the build machine** —
+recorded in `pom.xml` beside the property and in CLAUDE.md.
+
+### The canary set: every distinct variable in the fleet
+
+| Canary | Type | Node | What only it covers |
+|---|---|---|---|
+| `ckaws-canary` | Pipeline | multitenant | standard shape on a slave |
+| `ckaws-canary-master` | Pipeline | controller | 28 profiles; the trailing-blank file |
+| `ckaws-canary-freestyle` | Freestyle | multitenant | Freestyle on a slave |
+| `ckaws-canary-freestyle-master` | Freestyle | controller | Freestyle on the controller |
+| `ckaws-canary-drupal` | Freestyle | drupal | **no `[default]`** — the append path |
+| `ckaws-canary-pdf` | Freestyle | pdf-to-csv | **AWS CLI 2.9.5**, the oldest in the fleet |
+
+The four agents not covered share a byte-identical configuration with
+multitenant, so a canary on each would re-test the same shape.
+
+### Baselines, all six, before the upgrade
+
+Every one: `CK_AWS_SESSION_NAME` and `AWS_CONFIG_FILE` **unset**, unprofiled
+calls resolving to `…/ck-ops-jenkins-master-instance-iam-role/i-<instance>`, and
+profiled calls carrying an SDK-generated `botocore-session-…` name.
+
+The two Freestyle baselines are the important ones: **in scope, plugin enabled,
+and still unset** — evidence that Freestyle was genuinely uncovered rather than
+merely excluded by a pattern.
+
+Also confirmed by the baselines: drupal *does* have an instance role, so
+unprofiled attribution can work there; and pdf-to-csv resolves the standard
+configuration on CLI 2.9.5.
+
+### A note on canary scripts
+
+Probes should end in `exit 0`. `set +e` stops a script aborting early, but the
+shell's exit status is still the last command's, so a failed probe marks the
+build red — and after an upgrade a failing probe is something to *read*, not
+something to be told about by a red icon.

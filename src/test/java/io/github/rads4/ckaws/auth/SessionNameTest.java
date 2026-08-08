@@ -1,6 +1,7 @@
 package io.github.rads4.ckaws.auth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -51,6 +52,28 @@ class SessionNameTest {
         assertTrue(name.value().endsWith("-4242"), "must keep the build number");
         assertTrue(STS_CHARSET.matcher(name.value()).matches());
         assertTrue(STS_VALID.matcher(name.value()).matches());
+    }
+
+    /**
+     * Truncation keeps the end of the job name, not the beginning.
+     *
+     * <p>In a folder hierarchy the leading segments are shared by every job in that folder while the
+     * trailing segment names the job itself. Truncating from the front therefore discards precisely the
+     * part that distinguishes one build from another, and two jobs in the same deep folder would then
+     * produce the same session name — silently merging two builds in an audit trail.
+     */
+    @Test
+    void truncationKeepsTheDistinguishingTailOfTheJobName() {
+        String folder = repeat("deep-folder/", 6);
+
+        SessionName first = SessionName.forBuild(folder + "authbridge", 12);
+        SessionName second = SessionName.forBuild(folder + "rivon", 12);
+
+        assertTrue(first.value().length() <= 64);
+        assertTrue(second.value().length() <= 64);
+        assertTrue(first.value().endsWith("authbridge-12"), "the job's own name must survive: " + first.value());
+        assertTrue(second.value().endsWith("rivon-12"), "the job's own name must survive: " + second.value());
+        assertNotEquals(first.value(), second.value(), "two jobs in one folder must not share a session name");
     }
 
     @Test

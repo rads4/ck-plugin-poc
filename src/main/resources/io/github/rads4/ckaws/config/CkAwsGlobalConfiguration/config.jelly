@@ -2,9 +2,58 @@
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
   <f:section title="CK AWS">
     <f:entry
+        title="Managed authentication"
+        field="managedAuthentication"
+        description="When enabled, Jenkins prepares AWS authentication for every Pipeline build in scope. Pipelines need no wrapper, no plugin step and no changes: the profiles the agent already defines keep working, and gain the session name jk-JOB-BUILD. Off by default. Turning it off never disturbs a running build — builds already under way finish under their existing session.">
+      <f:checkbox/>
+    </f:entry>
+
+    <f:entry
+        title="Apply to jobs matching"
+        field="jobNamePattern"
+        description="Optional regular expression, matched against a job's FULL name (e.g. uat/Backend/deploy) in its entirety. Blank applies to every Pipeline job. Use this to roll out one job or one folder at a time. An invalid expression matches nothing, so a typo narrows the rollout rather than widening it.">
+      <f:textbox/>
+    </f:entry>
+
+    <f:entry
+        title="Except jobs matching"
+        field="jobNameExcludePattern"
+        description="Optional regular expression, same matching rules. Evaluated after the include pattern and wins over it. Blank excludes nothing. This is the switch to reach for during an incident: excluding one job needs no restart and leaves every other job attributed.">
+      <f:textbox/>
+    </f:entry>
+
+    <f:entry
+        title="Apply on nodes labelled"
+        field="nodeLabelPattern"
+        description="Optional regular expression, matched in full against each of the executing node's labels (and its node name; the built-in node matches 'built-in'). Blank applies on every node. Useful when one agent carries a different AWS configuration, or makes no AWS calls at all.">
+      <f:textbox/>
+    </f:entry>
+
+    <f:entry
+        title="Attribute unprofiled calls as"
+        field="unprofiledRoleArn"
+        description="Optional IAM role ARN. AWS calls that name no profile fall through to the agent's base identity, whose session name is fixed by the platform and cannot be changed — so they cannot be attributed unless a role is assumed on their behalf. Set this and the generated [default] assumes that role under the build's session name. Use the agent's OWN instance role: assuming a different role changes the principal ARN, and bucket, key and repository policies grant access by principal ARN. Blank leaves these calls exactly as they are today.">
+      <f:textbox/>
+    </f:entry>
+
+    <f:entry
         title="AWS profiles"
-        description="Maps a profile name that pipelines ask for to the role the build should assume. Pipelines never name an ARN.">
+        description="Optional. The agent's own AWS configuration is the source of truth and is used as-is; entries here are only added for profiles the agent does not define. Leave the role ARN blank for a profile that should use the agent's own identity.">
       <f:repeatableProperty field="profiles" add="Add profile" minimum="0"/>
+    </f:entry>
+
+    <f:entry
+        title="Agent base identity"
+        field="credentialSource"
+        description="Leave this alone unless the Jenkins AGENTS themselves run on ECS/EKS — this is about where the agent process runs, not where your applications are deployed. It answers one question: when a profile assumes a role, where do the starting credentials come from? Ec2InstanceMetadata for EC2 agents (the usual case), EcsContainer for agents running as ECS/Fargate tasks, Environment when the agent already has credentials in its environment. It applies ONLY to profiles this plugin writes — the [default] used for unprofiled attribution, and any profile added in the list above. Profiles copied from the agent's own configuration keep their own setting.">
+      <f:select/>
+    </f:entry>
+
+    <f:entry
+        title="Diagnostics"
+        field="diagnostics"
+        description="Prints what the plugin found on the agent and what it changed — configuration path, sections found, decorated and appended, and the exported values. Non-sensitive throughout: no file contents and no credentials. Safe to turn on during an investigation and off again afterwards, with no restart.">
+      <f:checkbox/>
     </f:entry>
   </f:section>
 </j:jelly>

@@ -18,7 +18,16 @@
   <description>Centralizes AWS authentication and generic AWS CLI execution for Jenkins deployment pipelines.</description>
 
   <properties>
-    <revision>1.0</revision>
+    <revision>2.1</revision>
+    <!--
+      Build a release, not a private snapshot: `mvn -Dchangelist= clean verify` produces a versioned
+      ck-aws whose version string is meaningful on a controller. A `-SNAPSHOT (private-<hash>-<user>)`
+      build cannot be identified after the fact.
+
+      ALWAYS RAISE THIS BEFORE PRODUCING AN ARTIFACT THAT LEAVES THIS MACHINE. Two different builds
+      must never share a version: "the controller says 2.0" has to answer "which 2.0" unambiguously,
+      and it cannot if 2.0 was rebuilt. Patch bump for a fix, minor for a capability.
+    -->
     <changelist>-SNAPSHOT</changelist>
     <!--
       Baseline is pinned to CloudKeeper's actual Jenkins version (2.479.2) rather than the

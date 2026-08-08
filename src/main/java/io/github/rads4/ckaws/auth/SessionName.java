@@ -68,7 +68,11 @@ public final class SessionName {
 
         String job = sanitizeJobSegment(jobName);
         if (job.length() > roomForJob) {
-            job = trimDashes(job.substring(0, roomForJob));
+            // Keep the TAIL, not the head. In a folder hierarchy the leading segments are shared by every
+            // job in that folder while the trailing segment is the job itself, so truncating from the
+            // front discards exactly the part that distinguishes one build from another — and two jobs in
+            // the same deep folder would then collide on an identical session name.
+            job = trimDashes(job.substring(job.length() - roomForJob));
         }
 
         // If the job segment sanitized/trimmed away to nothing, drop it entirely: "jk-<build>" still
