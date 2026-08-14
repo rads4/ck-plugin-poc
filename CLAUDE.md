@@ -38,11 +38,27 @@ project.**
 | M12 — Managed Authentication: decorate the node's own configuration | Implemented, validated in production on two unmodified pipelines |
 | ~~M12i — production incident investigation (Gradle 403)~~ | **Closed: the plugin was not the cause.** See below |
 | v2.0 — unprofiled attribution, output verification, runtime controls | Superseded by 2.1 before wide rollout |
-| **v2.1 — Freestyle coverage, trailing-blank fix, no-role profiles** | **Implemented, 201 tests, `ck-aws 2.1`** |
+| v2.1 — Freestyle coverage, trailing-blank fix, no-role profiles | Implemented, 201 tests — **this is what is installed on CK production** |
+| **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only** | **Implemented, 210 tests, `ck-aws 2.2`. Built, not yet installed** |
 
-**Versioning:** raise `<revision>` in `pom.xml` before producing any artifact that leaves the
-build machine. Two builds must never share a version — during the v2.0 rollout three different
-artifacts all reported `Plugin-Version: 2.0`, which made "the controller says 2.0" meaningless.
+**Versioning: versions track INSTALLATIONS, not builds.** The number must change before an
+artifact is *installed* on a controller, so that "the controller says 2.2" answers "which 2.2"
+unambiguously. A number that has been installed is **spent forever** and must never be reused.
+A number that was only ever built locally is **not** spent, and may be re-taken by the build
+that actually ships.
+
+Applying that rule: 2.1 is installed on CK production. Builds numbered 2.2, 2.3 and 2.4 were
+produced during the August 2026 defect work and their hashes circulated, but none was ever
+installed — so the build that ships re-takes **2.2**. Only
+`sha256 b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45` may be installed;
+earlier artifacts claiming 2.2/2.3/2.4 are void, and the first of them still contained the
+shadowing defect. Superseded hashes are listed in MEMORY.md, Session 23.
+
+This rule replaces the older "raise `<revision>` before any artifact leaves the build machine",
+which produced a version inflation of three unused numbers. The problem it was written for is
+still real — during the v2.0 rollout three different artifacts all reported `Plugin-Version: 2.0`,
+making "the controller says 2.0" meaningless — but the fix is to pin the number to the
+*installation*, not to every `mvn package`.
 
 ---
 
@@ -1299,12 +1315,13 @@ document favours an option.
 - **Do not put the generated file in the workspace, and never trust that a file in
   `@tmp` is still there.** `deleteDir()`, `git clean -fdx` and `cleanWs()` all
   reach those. This rule predates the implementation and the implementation
-  drifted from it: 2.2 and earlier wrote to `<workspace>@tmp` and memoized the
+  drifted from it: 2.1 and every unreleased build before the fix wrote to
+  `<workspace>@tmp` and memoized the
   path for the whole build, so a mid-build clean left every later step exporting
   `AWS_CONFIG_FILE=<deleted file>`. An AWS SDK reads a missing config file as an
   *empty* one, so `--profile x` then fails with "The config profile could not be
   found" — nothing thrown, nothing logged. Reproduced in
-  `ProductionFailureModesTest`. 2.3 keeps the `@tmp` sibling (the only location a
+  `ProductionFailureModesTest`. 2.2 keeps the `@tmp` sibling (the only location a
   container mount is guaranteed to see) and **re-checks existence before reusing
   the memo**, regenerating when it is gone. Either invariant is acceptable;
   silently handing out a stale path is not.
@@ -1339,7 +1356,7 @@ document favours an option.
 
 ---
 
-# Residual risk register (as of 2.3)
+# Residual risk register (as of 2.2)
 
 Everything below was established by reproduction or by census, not by argument.
 Re-verify before widening scope.
@@ -1386,7 +1403,7 @@ by the Freestyle path for free.
 - **Calls naming no profile** — `aws ecr get-login-password`, and any bare `aws`
   command — resolve straight to IMDS, whose session name EC2 fixes to the
   instance ID. They stay unattributed until *Attribute unprofiled calls as* is
-  set. Safe to set from 2.3 onward; the duplicate-key guard that makes it safe
+  set. Safe to set from 2.2 onward; the duplicate-key guard that makes it safe
   ships with it.
 - **Terraform's own `assume_role` block** (55 of 432 workspaces). `session_name`
   appears in no `.tf` file, so the second hop gets an SDK-generated name. Still

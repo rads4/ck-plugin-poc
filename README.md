@@ -10,7 +10,20 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 2.1 — implemented, 201 tests, validated in production.**
+**Status: 2.2 — implemented, 210 tests. 2.1 is what is installed on CK production.**
+
+> **Versions track installations, not builds.** A number must change before an
+> artifact is *installed* on a controller, so that "the controller says 2.2"
+> answers "which 2.2" unambiguously. A number that has been installed is spent
+> forever; a number only ever built locally is not spent and may be re-taken.
+> Builds numbered 2.2, 2.3 and 2.4 were produced during the August 2026 defect
+> work and their hashes were circulated, but **none was ever installed**, so the
+> shipping build re-takes **2.2**.
+>
+> **Only `sha256 b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45`
+> may be installed.** Any earlier artifact calling itself 2.2, 2.3 or 2.4 is void —
+> the first of them still contained the context-shadowing defect. See
+> [MEMORY.md](MEMORY.md), Session 23, for the superseded hashes.
 
 Two unmodified production pipelines ran with Managed Authentication on and were
 fully attributed in CloudTrail — a prod ECS deployment (25 events) and a non-prod
@@ -25,6 +38,44 @@ unmodified `aws --profile non_prod ...` is authenticated and attributed as
 `jk-<job>-<build>`. It is **off by default**, and with it off the plugin is
 indistinguishable from not being installed. `ckAwsWithProfile` remains supported
 as the explicit override.
+
+**New in 2.2 — four defect fixes and observe-only mode**
+
+2.1 shipped a defect that broke real jobs. `dev2/rivon` failed twice the moment it
+was added to the rollout scope and passed with it removed — a controlled
+experiment that identified the plugin as the cause. A census of 718 production
+build logs then showed the exposure was not one job: **~89% of every `sh`
+invocation in production had the affected shape**, across 371 distinct jobs.
+
+- **Context shadowing (the rivon defect).** The plugin's `DynamicContext` answered
+  unconditionally, which shadowed the `EnvironmentExpander` published by an
+  enclosing `withCredentials`. `ContextVariableSet.get` consults every
+  `DynamicContext` at the current level *before* recursing to the parent, so a
+  non-null answer hides the enclosing level entirely — Nexus credentials expanded
+  to empty and Gradle fell through to a public mirror that 403s. The plugin now
+  merges with, rather than replaces, whatever is already in context. Note
+  `EnvironmentExpander.merge(a, b)` null-checks only its *first* argument, so the
+  order and the guard both matter.
+- **Workspace anchoring.** The generated file was anchored to the *current*
+  directory, so inside `dir('x')` it landed somewhere else. It is now anchored to
+  the build's workspace via `node.getWorkspaceFor(...)`, falling back to the
+  current path when that is outside the workspace.
+- **Stale memo.** The path was memoized for the whole build, so a mid-build
+  `cleanWs()` / `deleteDir()` / `git clean -fdx` left every later step exporting
+  `AWS_CONFIG_FILE=<deleted file>`. An AWS SDK reads a missing config file as an
+  *empty* one, so `--profile x` then fails with "The config profile could not be
+  found" — nothing thrown, nothing logged. Existence is now re-checked before the
+  memo is reused.
+- **Parallel race.** Concurrent `parallel` branches could prepare the same key at
+  once. Preparation is now under a per-key lock.
+- **Observe-only mode.** Prepare, decorate, validate, write and report — and
+  export *nothing*. Rivon proved that a guard which only catches exceptions cannot
+  catch a contribution that succeeds and still removes something. Observe-only is
+  the control that closes that gap: scope can be widened to every job under real
+  traffic with zero possibility of affecting one, which is the only honest way to
+  survey the 637 jobs whose definitions live in SCM and cannot be read ahead of
+  time. The escalation order is now **structural invariant → per-job exclude →
+  observe-only → master switch last**.
 
 **New in 2.0**
 

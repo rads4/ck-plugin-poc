@@ -2493,3 +2493,132 @@ mistaken for the shipping build:
 | old 2.4 | `47b8f3ae192c3d8742cd66e1e1e3751c179bf28807426605b461725f3474805e` |
 
 Only `b4c94c78…` may be installed.
+
+### Session 24 — 2026-08-14 — POC clone verified; 2.2 NOT yet installed
+
+The POC controller clone (`poc-jenkins`, `i-0ce520741740bf2f6`, `10.20.94.122`,
+ops account, same VPC as infra by design) is built, neutralised and **verified
+isolated**. 2.2 is deliberately **not installed yet** — the clone is being held in
+a known-good, fully preserved state first.
+
+**Two defects found in the POC setup, both mine, both now understood.**
+
+**1. `init.groovy.d` hooks never ran — a Groovy filename defect.**
+
+```
+java.lang.ClassFormatError: Illegal class name "00-poc-admin$imds"
+    at 00-poc-admin.run(00-poc-admin.groovy:38)
+```
+
+Groovy derives a script's class name from its **filename**. `00-poc-admin.groovy`
+becomes class `00-poc-admin`; when the script calls a method it defines itself
+(`imds(...)`), Groovy generates a call-site helper class `00-poc-admin$imds`. A
+JVM class name may not begin with a digit or contain a hyphen, so it fails at the
+first self-call. Because `GroovyInitScript.init` propagates this as an `Error`,
+**the entire init task aborted** — so `01-` and `02-` never executed either.
+
+Consequences, all still outstanding: triggers were never stripped (37 job
+`config.xml` files still carry `TimerTrigger`/`SCMTrigger`/`GitLabPushTrigger`),
+notification credentials were never removed, and `poc-admin` was never created.
+None of it can act while executors are 0 and no clouds are defined.
+
+Fix (not yet applied): rename to identifiers that are legal JVM class names —
+`poc00Admin.groovy`, `poc01DisableTriggers.groovy`,
+`poc02StripNotifyCredentials.groovy`. Alphabetical ordering, which is what
+Jenkins uses, is preserved. **A numeric or hyphenated `init.groovy.d` filename is
+only safe if the script never calls a method it defines itself** — which is why
+this convention is used everywhere and looked fine.
+
+**2. Cloned `JENKINS_HOME` resumes in-flight Pipeline builds.**
+
+The AMI was taken from a live controller, so four builds were mid-flight inside
+it: `ecr-replication#485`, `uat/batchprocessor#152`, `qa1/azure-insights#248`,
+`prod/tuner-mcp#5`. Deleting `queue.xml` does **not** stop these — resumable
+executions are restored from `org.jenkinsci.plugins.workflow.flow.FlowExecutionList.xml`,
+independently of the queue, and `program.dat` per build holds the CPS state. On
+first boot the clone resumed all four. They could not proceed (0 executors, no
+clouds) and parked at their `node` steps, logging
+`ExecutorStepExecution$AnomalousStatus` every 5 minutes. **Zero AWS API calls were
+ever made from the clone** — CloudTrail, whole history.
+
+Fixed by a `#cloud-boothook` in the instance user-data, which runs as root on
+**every** boot, before `jenkins.service`: it masks Jenkins by symlinking
+`/etc/systemd/system/jenkins.service → /dev/null`, then moves `FlowExecutionList.xml`,
+`queue.xml` and `queue.xml.bak` to `/var/lib/poc-quarantine/<timestamp>/` — moved,
+not deleted, so it is reversible. It carries the same guard as everything else:
+refuses on `i-0924a915a1c76f33e`, requires `ckaws-poc=true` from IMDS.
+Confirmed working: Jenkins did not start at all on the following boot. A **new**
+`queue.xml` had appeared by then (07:54), so re-queueing was live and this was not
+theoretical.
+
+**Verified state of the clone** (Jenkins masked and down at time of measurement):
+
+| | |
+|---|---|
+| job `config.xml` | 810 · 305 top-level dirs · 1,739 build dirs |
+| `credentials.xml` | 80,503 bytes · 460 users · 206 plugins |
+| installed plugin | `ck-aws` **2.1** — untouched, from the AMI |
+| executors | 0 · `<clouds/>` empty · `nodes/` empty |
+| `jenkinsUrl` | `http://10.20.94.122:8080/` (infra: `https://jenkins.ck.tothenew.net/`) |
+| realm | `HudsonPrivateSecurityRealm` (SAML replaced, `saml.jpi` still on disk) |
+| resume state | quarantined; 4 `program.dat` remain but nothing references them |
+| AWS calls from clone | **zero**, entire CloudTrail history |
+| infra `jenkins-17` | `LaunchTime 2026-03-31`, unchanged; 3 agents running, none adopted |
+| clone SG `sg-03b1f1d96664aea1a` | **0 ingress**, 1 egress |
+
+Zero ingress is why the clone's URL does not open over the Pritunl split tunnel —
+by design. Access is SSM port-forward, which needs no SG change.
+
+**Still to do before 2.2 can be tested here:** rename and re-run the hooks; strip
+the 37 remaining triggers; create `poc-admin`; remove `saml.jpi` only *after*
+login is confirmed; re-create agent cloud templates with **distinct tags** (the
+EC2 plugin can adopt instances it believes are its own orphans) and only then
+raise executors above 0.
+
+### Session 24 addendum — correction: ALL testing happens on the clone
+
+Rads corrected a planning error of mine, and it is important enough to record so it
+is not repeated.
+
+I proposed running the observe-only survey **on infra Jenkins** to cover the job
+types that are unsafe to run on the clone. That defeats the entire purpose of
+building the clone. The rule is:
+
+> **No further tests, upgrades, restarts or scope changes on infra Jenkins.**
+> Everything — including the broad survey — happens on the POC clone. Infra
+> Jenkins is touched exactly once more, at the end: the final 2.2 install.
+
+The reason the wrong plan was tempting: the clone carries the **same instance
+profile as infra**, so `prod`/`dr`/`qa`/`uat` jobs would really succeed against
+production. That made those job types look untestable on the clone, and infra
+looked like the only place to observe them. Both halves of that are wrong.
+
+**Wrong half 1 — the plugin's failure modes do not need a successful AWS call.**
+Every defect found so far is about what the plugin does to the *environment and
+the config file*, not about whether AssumeRole succeeds. The rivon defect was
+Nexus credentials expanding to empty — no AWS call involved at all. So a job whose
+AWS access is denied still exercises the entire contribution surface: config
+generation, environment merge, workspace anchoring, mid-build clean, parallel,
+Freestyle vs Pipeline.
+
+**Wrong half 2 — job *shapes*, not job *identities*, are what need covering.**
+The census already produced the exact context stacks and their frequencies across
+718 real builds. Those stacks can be replayed as canary pipelines on the clone,
+including stacks that only occur in prod/qa/uat jobs. That gives structural
+coverage of all job types — present and future — with zero risk and nothing
+running on infra.
+
+Consequences recorded for the plan:
+
+1. Observe-only is a control for use **on the clone**, and later as the first
+   rollout stage on infra *after* the install — never as a reason to experiment on
+   infra beforehand.
+2. To run prod/qa/uat-shaped real jobs on the clone, swap the clone's instance
+   profile for a **POC-only role that cannot assume prod/dr/qa/uat**. Those jobs
+   then fail closed at the AWS boundary while still exercising the plugin. This is
+   an IAM change and needs Rads' explicit approval; it also does **not** bound
+   non-AWS effects (a stored SSH credential, a Nexus publish), so it is not on its
+   own a licence to run production jobs.
+3. The **structural additions-only invariant** matters more under this rule than it
+   did before: enumeration cannot cover jobs whose definitions live in SCM, so the
+   plugin must refuse to contribute when any variable it does not own would change.
