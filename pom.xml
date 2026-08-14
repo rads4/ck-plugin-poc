@@ -18,15 +18,24 @@
   <description>Centralizes AWS authentication and generic AWS CLI execution for Jenkins deployment pipelines.</description>
 
   <properties>
-    <revision>2.1</revision>
+    <revision>2.2</revision>
     <!--
       Build a release, not a private snapshot: `mvn -Dchangelist= clean verify` produces a versioned
       ck-aws whose version string is meaningful on a controller. A `-SNAPSHOT (private-<hash>-<user>)`
       build cannot be identified after the fact.
 
-      ALWAYS RAISE THIS BEFORE PRODUCING AN ARTIFACT THAT LEAVES THIS MACHINE. Two different builds
-      must never share a version: "the controller says 2.0" has to answer "which 2.0" unambiguously,
-      and it cannot if 2.0 was rebuilt. Patch bump for a fix, minor for a capability.
+      VERSIONS TRACK INSTALLATIONS, NOT BUILDS.
+      The number must change before an artifact is INSTALLED on a controller, so that
+      "the controller says 2.2" answers "which 2.2" unambiguously. A number that has been
+      installed is spent forever and must never be reused. A number that was only ever built
+      locally is not spent, and may be re-taken by the build that actually ships.
+
+      History, so the record is not confusing: 2.1 is the version installed on CK production.
+      Builds numbered 2.2, 2.3 and 2.4 were produced during the August 2026 defect work and
+      their sha256 values were shared, but NONE was ever installed. 2.2 as shipped is the
+      build carrying all four fixes plus observe-only mode. Any artifact claiming to be an
+      earlier 2.2/2.3/2.4 is void and must not be installed - the first of them still
+      contained the DynamicContext shadowing defect.
     -->
     <changelist>-SNAPSHOT</changelist>
     <!--

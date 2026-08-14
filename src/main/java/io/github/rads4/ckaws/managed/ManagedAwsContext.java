@@ -91,6 +91,18 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      */
     private static final Map<String, Map<String, String>> PREPARED = new ConcurrentHashMap<>();
 
+    /** The variable a build's AWS SDKs read the generated configuration from. */
+    static final String CONFIG_VARIABLE = "AWS_CONFIG_FILE";
+
+    /** The build's session name, exported so a script can log or tag with it. */
+    static final String SESSION_VARIABLE = "CK_AWS_SESSION_NAME";
+
+    /**
+     * One monitor per prepared key, so concurrent branches sharing a workspace prepare it once between
+     * them rather than racing to write the same file. Evicted with {@link #PREPARED}.
+     */
+    private static final Map<String, Object> LOCKS = new ConcurrentHashMap<>();
+
     @Override
     protected Class<EnvironmentExpander> type() {
         return EnvironmentExpander.class;
@@ -167,8 +179,8 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         }
 
         // No workspace means no agent, which means no process that could consume this.
-        FilePath workspace = context.get(FilePath.class);
-        if (workspace == null) {
+        FilePath current = context.get(FilePath.class);
+        if (current == null) {
             return null;
         }
 
@@ -178,8 +190,70 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         }
 
         Map<String, String> variables = prepareOnce(
-                run, workspace, node, context.get(Computer.class), configuration, context.get(TaskListener.class));
-        return variables == null ? null : EnvironmentExpander.constant(variables);
+                run,
+                buildWorkspace(current, node, run),
+                node,
+                context.get(Computer.class),
+                configuration,
+                context.get(TaskListener.class));
+        if (variables == null) {
+            return null;
+        }
+
+        // Observe only: everything above ran - the configuration was read, decorated, safety-checked and
+        // written, and the console says what would have happened - but nothing is exported. A build in
+        // this mode cannot observe the plugin, so it cannot be broken by it. See
+        // CkAwsGlobalConfiguration#isObserveOnly for why this exists.
+        if (configuration.isObserveOnly()) {
+            return null;
+        }
+
+        // Contribute ALONGSIDE what the build already has, never instead of it.
+        //
+        // A DynamicContext that answers unconditionally short-circuits the walk to the enclosing
+        // context level: ContextVariableSet.get scans the current level, then consults every
+        // DynamicContext, and only then recurses to its parent. So an EnvironmentExpander published by
+        // an enclosing withCredentials/withEnv/withAWS block is never reached the moment any inner
+        // block - dir, ws, container - adds a context level of its own, and its bindings vanish with
+        // no error. Measured in production: dev2/rivon #942 and #944 lost their Nexus credentials to
+        // exactly this, while #943 with the job out of scope passed.
+        //
+        // Order is load-bearing: ours expands FIRST so anything the build set deliberately wins. This
+        // plugin decorates the node's default, and a value a job chose is not a default.
+        EnvironmentExpander ours = EnvironmentExpander.constant(variables);
+        EnvironmentExpander existing = context.get(EnvironmentExpander.class);
+        // merge() null-checks only its first argument; passing null as the second NPEs on expand.
+        return existing == null ? ours : EnvironmentExpander.merge(ours, existing);
+    }
+
+    /**
+     * The workspace the generated file belongs to: the build's, not whatever directory a step is in.
+     *
+     * <p>{@link DelegatedContext#get} for a {@link FilePath} returns the <em>current</em> directory, so
+     * inside {@code dir('application/service')} it is a directory in the middle of a checked-out source
+     * tree. Writing there scatters {@code ck-aws/} through the source, prepares the same file once per
+     * {@code dir} block, and - when a step changes into a directory outside the workspace - leaves a
+     * directory on the agent that no workspace cleanup will ever reclaim.
+     *
+     * <p>The canonical workspace is used only when the current directory is genuinely inside it. That
+     * distinction is what keeps the other shapes correct: {@code ws('other')} allocates a workspace that
+     * is not under this job's, and a second concurrent build gets {@code …/job@2}, which is not under
+     * {@code …/job} either. Both fall back to the path they were given, which is the right answer for
+     * them.
+     */
+    @CheckForNull
+    static FilePath buildWorkspace(@CheckForNull FilePath current, @CheckForNull Node node, Run<?, ?> run) {
+        if (current == null || node == null || !(run.getParent() instanceof hudson.model.TopLevelItem)) {
+            return current;
+        }
+        FilePath workspace = node.getWorkspaceFor((hudson.model.TopLevelItem) run.getParent());
+        if (workspace == null) {
+            return current;
+        }
+        String here = current.getRemote();
+        String root = workspace.getRemote();
+        boolean inside = here.equals(root) || here.startsWith(root + "/") || here.startsWith(root + "\\");
+        return inside ? workspace : current;
     }
 
     /**
@@ -203,26 +277,65 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             throws InterruptedException {
 
         String key = key(run, workspace);
-        Map<String, String> prepared = PREPARED.get(key);
-        if (prepared != null) {
+        // Exactly one preparation per key, even when parallel branches sharing a workspace arrive at the
+        // same instant. Both would otherwise miss the memo and write the same path concurrently, and a
+        // third reader can then see a half-written file - which an AWS SDK rejects as malformed, failing
+        // every call in that branch. putIfAbsent alone does not prevent this: it deduplicates the memo
+        // entry after the fact, long after both writes have already happened.
+        Object lock = LOCKS.computeIfAbsent(key, unused -> new Object());
+        synchronized (lock) {
+            Map<String, String> prepared = PREPARED.get(key);
+            if (prepared != null && stillOnDisk(prepared, node)) {
+                return prepared;
+            }
+            try {
+                prepared = prepareVariables(run, workspace, node, computer, configuration, listener);
+            } catch (InterruptedException e) {
+                throw e;
+            } catch (Exception e) {
+                // An expected, diagnosable failure: a disk or permission problem on one node must not
+                // become an outage across every job. Reported to the console so the loss is visible.
+                LOGGER.log(Level.WARNING, e, () -> "ck-aws: could not decorate AWS configuration for " + run);
+                warn(listener, "could not read or write AWS configuration (" + e.getMessage() + ")");
+                PREPARED.remove(key);
+                return null;
+            }
+            if (prepared == null) {
+                PREPARED.remove(key);
+                return null;
+            }
+            PREPARED.put(key, prepared);
             return prepared;
         }
+    }
+
+    /**
+     * Whether the generated file is still where the memo says it is.
+     *
+     * <p>{@code cleanWs()} and {@code deleteDir()} in the middle of a build are ordinary idioms, and
+     * either removes the generated file while the memo keeps handing out its path for every later step.
+     * An AWS SDK reads a missing {@code AWS_CONFIG_FILE} as an <em>empty</em> configuration rather than
+     * an error, so {@code --profile non_prod} then fails with "The config profile could not be found" -
+     * nothing thrown, nothing logged, and a deployment that stops for a reason nobody can see.
+     *
+     * <p>One stat per step on an already-open channel, in exchange for turning a silent failure into a
+     * regenerated file.
+     */
+    private static boolean stillOnDisk(Map<String, String> prepared, @CheckForNull Node node)
+            throws InterruptedException {
+        String path = prepared.get(CONFIG_VARIABLE);
+        if (path == null || node == null) {
+            return true;
+        }
         try {
-            prepared = prepareVariables(run, workspace, node, computer, configuration, listener);
-        } catch (InterruptedException e) {
-            throw e;
-        } catch (Exception e) {
-            // An expected, diagnosable failure: a disk or permission problem on one node must not become
-            // an outage across every job. Reported to the console so the lost attribution is visible.
-            LOGGER.log(Level.WARNING, e, () -> "ck-aws: could not decorate AWS configuration for " + run);
-            warn(listener, "could not read or write AWS configuration (" + e.getMessage() + ")");
-            return null;
+            FilePath file = node.createPath(path);
+            return file != null && file.exists();
+        } catch (IOException | RuntimeException e) {
+            // An agent that cannot be reached cannot be repaired by regenerating. Keep what we have and
+            // let the build fail on its own terms rather than losing the configuration to a transient.
+            LOGGER.log(Level.FINE, e, () -> "ck-aws: could not confirm " + path + " still exists");
+            return true;
         }
-        if (prepared == null) {
-            return null;
-        }
-        PREPARED.putIfAbsent(key, prepared);
-        return prepared;
     }
 
     /**
@@ -297,7 +410,11 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
 
         if (listener != null) {
             listener.getLogger()
-                    .println("[ck-aws] AWS configuration decorated as session " + sessionName
+                    .println("[ck-aws] "
+                            + (configuration.isObserveOnly()
+                                    ? "OBSERVE ONLY, nothing exported: would decorate as session "
+                                    : "AWS configuration decorated as session ")
+                            + sessionName
                             + (nodeConfigFile == null ? "" : " (from " + nodeConfigFile.getRemote() + ")")
                             + (result.unprofiledAttributed() ? "; calls naming no profile are attributed too" : ""));
             if (configuration.isDiagnostics() || SystemProperties.getBoolean(DIAGNOSTICS_PROPERTY)) {
@@ -306,7 +423,7 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         }
 
         // AWS_SHARED_CREDENTIALS_FILE is deliberately absent: see the class javadoc.
-        return Map.of("AWS_CONFIG_FILE", config.getRemote(), "CK_AWS_SESSION_NAME", sessionName);
+        return Map.of(CONFIG_VARIABLE, config.getRemote(), SESSION_VARIABLE, sessionName);
     }
 
     /**
@@ -421,6 +538,8 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
     static void forget(@NonNull Run<?, ?> run) {
         String prefix = run.getExternalizableId() + ' ';
         PREPARED.keySet().removeIf(key -> key.startsWith(prefix));
+        // Leaving these would leak one monitor per node block of every build the controller ever ran.
+        LOCKS.keySet().removeIf(key -> key.startsWith(prefix));
     }
 
     /** Visible for tests: how many builds currently hold prepared state. */

@@ -85,7 +85,12 @@ public final class ManagedAwsFreestyleEnvironment extends EnvironmentContributor
         }
 
         Computer computer = node == null ? null : node.toComputer();
-        return ManagedAwsContext.prepareOnce(build, workspace, node, computer, configuration, listener);
+        Map<String, String> variables =
+                ManagedAwsContext.prepareOnce(build, workspace, node, computer, configuration, listener);
+
+        // Observe only: prepared and reported, deliberately not exported. Identical to the Pipeline path
+        // so the two modes cannot mean different things on different job types.
+        return configuration.isObserveOnly() ? null : variables;
     }
 
     /** As for Pipeline: the built-in node reports no labels, so its node name is matched as well. */

@@ -2328,3 +2328,168 @@ Probes should end in `exit 0`. `set +e` stops a script aborting early, but the
 shell's exit status is still the last command's, so a failed probe marks the
 build red — and after an upgrade a failing probe is something to *read*, not
 something to be told about by a red icon.
+
+## Session 22 — 2026-08-09
+
+**Trigger.** `dev2/rivon` was added to the include pattern and failed; removed
+from scope, it passed; added back, it failed again. Three builds, same commit,
+same agent. I had initially attributed the failure to the pre-existing Gradle 403
+noise and was **wrong** — the alternation is a controlled experiment and the
+plugin was the cause.
+
+**Mechanism.** `ContextVariableSet.get` (verified by decompiling
+workflow-cps 4046) scans the current context level, consults every
+`DynamicContext`, and only then recurses to the parent. `ManagedAwsContext`
+answered unconditionally, so inside `withCredentials { dir { sh } }` the lookup
+never reached the level holding the merged credentials expander. `NEXUS_*`
+expanded to empty, Gradle got `-P…Repository=` with no value, never contacted
+Nexus, and the internal `com.ttn.ck:*` artifacts fell through to a public mirror
+that 403s. The pre-existing 403 lines were real but were a *symptom*, not the
+cause.
+
+**Deep-dive RCA.** Enumerated the whole always-on surface — three hooks
+(`DynamicContext`, `EnvironmentContributor`, `RunListener`); the two `ckAws*`
+steps are opt-in and no Jenkinsfile calls them. Built
+`ProductionFailureModesTest`, which runs real Pipeline builds. `dir`/`withEnv`
+cannot be test dependencies (`validate-hpi` rejects `workflow-basic-steps` even
+at test scope — measured), so `FakeBindingStep` and `FakeDirStep` reproduce
+verbatim what `CredentialsBindingStep` and `PushdStep` do to the context.
+
+Six probes, **three confirmed defects**, all fixed in 2.3:
+
+1. Context shadowing (critical) — merge instead of replace, ours first.
+2. File anchored to the current directory, so `dir` wrote `ck-aws/` into the
+   source tree — anchor to `node.getWorkspaceFor(job)`.
+3. Stale memo after a mid-build `cleanWs()`/`deleteDir()` — re-check existence
+   before reusing. **CLAUDE.md had forbidden this placement before the code was
+   written; the implementation had drifted from its own design doc.**
+4. Race between parallel branches — per-key lock (not a reproduced failure; the
+   window is real in code and the fix is cheap).
+
+209 tests green.
+
+**Blast radius, measured on the controller (read-only SSM, `ops-admin`).** 806
+job configs: 740 Pipeline, 39 Freestyle, 27 folders — **no matrix, maven,
+multibranch or external jobs, so coverage is structurally complete**. 637 jobs
+define their pipeline from SCM, so their shapes are invisible from the
+controller. Of what *is* visible, 12 inline jobs combine `withCredentials` with a
+nested block — all the `Stormus-*-Build-Publish-Nexus-Job` family across
+dev2–dev5/qa1–qa3/uat/prod, plus `nexus-gradle-poc` and two Cost-report jobs.
+Every one would have failed exactly like rivon. In the shared library, **8 of 9
+deployment vars** (`stormusDeployment`, `frontEndDeployment`, `nodeDeployment`,
+`kongDeployment`, …) have the same shape — essentially the whole ECS estate.
+
+The six jobs that reference `AWS_CONFIG_FILE` are the six canaries, not
+production. `docker.inside`/`container()`: **zero uses anywhere**, so container
+path visibility is not a live risk.
+
+**Terraform (`cln-infra-terraform`).** Seven pipelines, **no `withCredentials`
+and no `withEnv` at all**, so they were never exposed to the shadowing defect.
+`cleanWs()` is in `post { always }`, not mid-build. Provider auth resolves from
+`config_<workspace>.yml`: **416 of 432 workspaces set `profile: "<name>"` with
+`role: ""`** — resolved from the shared config file, therefore decorated and
+**fully audited**. The other 55 use the provider's own `assume_role` block, and
+`session_name` appears in **no `.tf` file anywhere** — that second hop gets an
+SDK-generated name, so it is attributable only transitively (CloudTrail records
+the `jk-*` session that called `AssumeRole`). Closing that gap is a Terraform-repo
+change, not a plugin one: set `session_name` from the `CK_AWS_SESSION_NAME` the
+plugin already exports.
+
+**Live state at end of session.** Controller runs 2.1, managed auth on, scope
+`(ckaws-canary(-.*)?)`, unprofiled ARN blank. 2.3 built and ready; not installed.
+
+### Session 22 addendum — the build-log census
+
+The 637 SCM-defined jobs cannot be read from the controller, but **their build
+logs record every step they executed**. Scanning the last 3 builds of every job
+(690 logs, 230 MB, `nice`/`ionice` throttled) gives runtime truth rather than
+static guesswork.
+
+Note for anyone repeating this: Jenkins prefixes each console line with a binary
+console note, so `grep '^\[Pipeline\]'` matches **nothing**. Drop the anchor.
+
+**Complete executed step vocabulary — 44 distinct steps.** The ones that matter:
+
+| Contributes an `EnvironmentExpander` (shadowable) | Publishes context, so may trigger shadowing |
+|---|---|
+| `withEnv` 1917 · `withCredentials` 562 · `tool`/`envVarsForTool` 534/515 · `withSonarQubeEnv` 250 · `withBuildUser` 13 · `wrap` 8 · `withFileParameter` 1 | **verified:** `dir` **2512**, `node` 654 · **near-certain:** `timestamps` 91, `ansiColor` 32 (a `ConsoleLogFilter` is their whole purpose) · **unverified:** `catchError` 453, `parallel` 11, `timeout` 6 |
+
+Only `dir` was reproduced directly; the rest of the right-hand column is inferred
+from what each step exists to do, and was deliberately **not** relied on. That is
+the point: a fix built by enumerating trigger steps would have missed one —
+`timestamps` and `ansiColor` were not on the original hypothesis list at all. The
+fix sits at the context-resolution layer instead, so it holds for every step in
+this table and every step not yet written, which is why the unverified entries
+never needed verifying.
+
+**Blast radius, measured: 441 build logs across 371 distinct jobs exhibit the
+shadowing shape** — more than half of every job that has ever run, spanning
+`ck-analytics-*`, `auto-analytics-*`, `ck-uat-new-*`, `ck-demo-*`,
+`ck-fluentd-deployment-prod`, `ck-drupal-*-terraform-pipeline`,
+`cln-infra-terraform-pipelines/*`, the `Library_Build_Job*` family and more.
+
+**Zero uses** of `container`, `ws`, `docker.inside`, `withAWS` or `withKubeConfig`
+anywhere in executed history — so container path-visibility of `@tmp` and
+`withAWS` precedence are not live risks today, only future ones.
+
+`input` (45) explains the 74-minute Terraform build from Session 21: it was
+parked awaiting approval, not holding credentials. Chained-credential expiry
+remains theoretical — the configs use `credential_source = Ec2InstanceMetadata`,
+not `source_profile` chaining, and every `sh` re-resolves credentials per process.
+
+### Session 22 addendum 2 — closing the last risks, and the safety net
+
+**Session names are settled.** All 27 role ARNs in the controller's config were
+probed with `sts assume-role --role-session-name jk-probe-secops-1` from the
+controller's own IMDS identity. 26 succeeded. The single denial,
+`275595855473/SecOpsAdminRole`, was re-probed with an SDK-style name and a neutral
+name and denied identically — a pre-existing permission gap, not a session-name
+restriction. No trust policy anywhere constrains `sts:RoleSessionName`.
+
+**No production job was ever damaged.** `Unable to parse config file` appears in 7
+builds, **all canaries** — the duplicate-key defect never escaped the canary set.
+`config profile could not be found`: zero. Two `ExpiredToken` and one AssumeRole
+denial exist in `prod/marketplace`, `qa1/marketplace` and
+`slack-messages-monitoring`, all out of scope and pre-existing.
+
+**The answer to "is the master switch the only safety net": no.** Rivon proved a
+guard that only catches exceptions cannot catch a contribution that succeeds and
+still removes something. 2.4 adds **observe-only mode** — prepare, decorate,
+validate, write, report, and export *nothing*. Scope can be widened to every job
+under real traffic with zero possibility of affecting one, which is the only
+honest way to survey the 637 SCM-defined jobs. Order of escalation is now:
+structural invariant, then per-job exclude, then observe-only, then the master
+switch last.
+
+**2.4** — `sha256 47b8f3ae192c3d8742cd66e1e1e3751c179bf28807426605b461725f3474805e`.
+210 tests. 2.3 was built and its hash shared but never installed; it lacks
+observe-only. Install 2.4.
+
+### Session 23 — 2026-08-14 — version renumbered to 2.2
+
+**Versioning rule refined by Rads: versions track INSTALLATIONS, not builds.**
+A number must change before an artifact is installed on a controller, so
+"the controller says 2.2" is unambiguous. A number that has been installed is
+spent forever. A number only ever built locally is *not* spent and may be
+re-taken by the build that actually ships.
+
+Applying that: 2.1 is what is installed on CK production. The builds numbered
+2.2, 2.3 and 2.4 during the August 2026 defect work were never installed, so
+those numbers were never spent. The build that ships is therefore **2.2**.
+
+**ck-aws 2.2 (shipping)** — `sha256 b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45`
+Contains all four defect fixes (context shadowing, workspace anchoring, stale
+memo, parallel race) plus observe-only mode. 210 tests.
+
+⚠️ **Any artifact claiming to be an earlier 2.2, 2.3 or 2.4 is void.** The first
+of those still contained the DynamicContext shadowing defect — the one that would
+break 371 jobs. Superseded hashes, recorded so they are recognisable and not
+mistaken for the shipping build:
+
+| void build | sha256 |
+|---|---|
+| old 2.2 | `fa854a3d4f0ffeea8d6250942801b2939e4d64e4dec8021e9f051fe2f98bafdd` |
+| old 2.3 | `728d1eb411b1c01462cea4e618ccf993671fe31348090e0d568b3282d0469856` |
+| old 2.4 | `47b8f3ae192c3d8742cd66e1e1e3751c179bf28807426605b461725f3474805e` |
+
+Only `b4c94c78…` may be installed.

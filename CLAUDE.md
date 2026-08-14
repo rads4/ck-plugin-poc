@@ -1296,14 +1296,144 @@ document favours an option.
   a region and a `credential_source`.
 - **Do not make Managed Authentication default to on.** The master switch ships off so
   that a plugin upgrade is behaviourally inert.
-- **Do not put the generated file in the workspace or in `@tmp`.** `deleteDir()`,
-  `git clean -fdx` and `cleanWs()` all reach those, and losing the file mid-build
-  silently returns the build to the unattributed `--profile` path.
+- **Do not put the generated file in the workspace, and never trust that a file in
+  `@tmp` is still there.** `deleteDir()`, `git clean -fdx` and `cleanWs()` all
+  reach those. This rule predates the implementation and the implementation
+  drifted from it: 2.2 and earlier wrote to `<workspace>@tmp` and memoized the
+  path for the whole build, so a mid-build clean left every later step exporting
+  `AWS_CONFIG_FILE=<deleted file>`. An AWS SDK reads a missing config file as an
+  *empty* one, so `--profile x` then fails with "The config profile could not be
+  found" — nothing thrown, nothing logged. Reproduced in
+  `ProductionFailureModesTest`. 2.3 keeps the `@tmp` sibling (the only location a
+  container mount is guaranteed to see) and **re-checks existence before reusing
+  the memo**, regenerating when it is gone. Either invariant is acceptable;
+  silently handing out a stale path is not.
+- **Do not anchor the generated file to the current working directory.** A
+  `DynamicContext` is handed the *current* `FilePath`, so inside
+  `dir('application/service')` that is a directory in the middle of a checked-out
+  source tree. 2.2 wrote `ck-aws/` there — once per `dir` block — and for a `dir`
+  outside the workspace would leave a directory no cleanup reclaims. Anchor to
+  `node.getWorkspaceFor(job)` when the current path is genuinely inside it, and
+  fall back otherwise so `ws()` and concurrent `…@2` workspaces stay correct.
+- **Do not return a bare value from a `DynamicContext` whose type another
+  contributor also supplies.** `ContextVariableSet.get` scans the current level,
+  consults every `DynamicContext`, and only *then* recurses to the parent. An
+  unconditional non-null answer therefore **shadows the enclosing level**. For
+  `EnvironmentExpander` that means every binding published by `withCredentials`,
+  `withEnv`, `withAWS`, `withSonarQubeEnv` or `configFileProvider` vanishes the
+  moment any inner block (`dir`, `ws`, `container`) adds a context level of its
+  own. Always `merge(ours, context.get(EnvironmentExpander.class))` — and note
+  `merge()` null-checks only its *first* argument, so a null second argument NPEs
+  on expand. Ours must expand **first**, so a value the job set deliberately
+  wins. Cost of getting this wrong, measured: `dev2/rivon` #942 and #944 lost
+  their Nexus credentials and failed; #943, with the job out of scope, passed.
+- **Do not memoize without a lock.** Parallel branches share a workspace and will
+  both miss the memo and write the same file at once; a third branch can then
+  read a half-written config. `putIfAbsent` does not prevent this — it
+  deduplicates the entry after both writes have already happened.
 - **Do not perform an STS call from a `DynamicContext`.** It is consulted for
   every step; the managed path must stay I/O-free after the first write. The
   AssumeRole belongs to the AWS tool, not to the plugin.
 - Do not add a second configuration location (job property, folder property) —
   the global mapping is the source of truth.
+
+---
+
+# Residual risk register (as of 2.3)
+
+Everything below was established by reproduction or by census, not by argument.
+Re-verify before widening scope.
+
+## The safety net is not the master switch
+
+The master switch is what you reach for *after* something breaks, and it needs a
+human watching a queue. The real net has three layers:
+
+1. **Structural.** The plugin can now only *add*. Both surfaces it touches have an
+   additions-only invariant: the config file is checked at runtime by
+   `AwsConfigOverlay.validate()`, and the environment is guaranteed by merge
+   ordering and locked by tests. This is what closes the class of defect that
+   broke `dev2/rivon` — a contribution that succeeded and still took something
+   away, which the exception guard could never have caught.
+2. **Per-job, instant.** *Except jobs matching* is a kill switch for one job that
+   needs no restart and no global toggle. Reach for it before the master switch.
+3. **Observe only.** Prepare everything, export nothing. Widen the scope to every
+   job, let real traffic run for a day, read the evidence, then enforce. This is
+   how you survey 740 jobs — including the 637 whose Jenkinsfiles live in SCM —
+   without any possibility of affecting one of them, and without watching a queue.
+
+Reach for them in that order. The master switch is the fourth thing, not the
+first.
+
+## Cannot fail — proven and test-locked
+
+Context shadowing, source-tree pollution, stale memo after a mid-build clean, the
+parallel write race, and a job's own `AWS_CONFIG_FILE` being overwritten. All in
+`ProductionFailureModesTest`. The shadowing fix is at the context-resolution
+layer, so it holds for **every** step — including ones nobody has written yet.
+
+## Coverage is structurally complete
+
+806 job configs: 740 Pipeline, 39 Freestyle, 27 folders. **No matrix, maven,
+multibranch or external jobs.** Every buildable job is either a `WorkflowRun`
+(hooked by `ManagedAwsContext`) or an `AbstractBuild` descendant (hooked by
+`ManagedAwsFreestyleEnvironment`, which is additive and cannot shadow). Matrix and
+Maven builds, should any appear, are `AbstractBuild` descendants and are covered
+by the Freestyle path for free.
+
+## Will not be audited today — by design, not by defect
+
+- **Calls naming no profile** — `aws ecr get-login-password`, and any bare `aws`
+  command — resolve straight to IMDS, whose session name EC2 fixes to the
+  instance ID. They stay unattributed until *Attribute unprofiled calls as* is
+  set. Safe to set from 2.3 onward; the duplicate-key guard that makes it safe
+  ships with it.
+- **Terraform's own `assume_role` block** (55 of 432 workspaces). `session_name`
+  appears in no `.tf` file, so the second hop gets an SDK-generated name. Still
+  traceable transitively — CloudTrail records the `jk-*` session that called
+  `AssumeRole`. Closing it is a Terraform-repo change: set `session_name` from the
+  `CK_AWS_SESSION_NAME` this plugin already exports.
+
+## Session names: settled, do not re-litigate
+
+All **27** role ARNs in the controller's configuration were probed with
+`sts assume-role --role-session-name jk-probe-secops-1`. **26 succeeded.** The one
+denial, `275595855473/SecOpsAdminRole`, was re-probed with an SDK-style name and a
+neutral name and denied identically — so it is a pre-existing permission gap, not
+a session-name restriction. **No trust policy anywhere constrains
+`sts:RoleSessionName`.** This risk is closed; re-probe only if trust policies
+change.
+
+## No production job has ever been damaged
+
+Scanning build history for AWS auth-failure signatures: `Unable to parse config
+file` appears in **7 builds, all of them canaries** (`ckaws-canary*` #3-#5) — the
+duplicate-key defect from the unprofiled-ARN experiment, contained entirely to the
+canary set. Zero production jobs. `config profile could not be found`: zero.
+`The source_profile`: zero. Two `ExpiredToken` and one `sts:AssumeRole` denial
+exist in `prod/marketplace`, `qa1/marketplace` and `slack-messages-monitoring` —
+all out of scope, all pre-existing, none plugin-related.
+
+## May fail — ranked, with the trigger
+2. **Malformed node configuration.** `ops_rds` on the controller carries a
+   `role_arn` with no `credential_source`. The plugin adds a session name and
+   leaves it no worse, but it was already broken.
+3. **Windows agents.** `chmod` would throw, the guard would fail open, and the
+   build would run unaudited rather than break. No Windows agents exist today.
+4. **Container agents.** `container()`, `docker.inside` and `withKubeConfig` have
+   **zero** executed history, so `@tmp` visibility inside a container mount is
+   untested. Verify before adopting Kubernetes agents.
+5. **Per-step cost.** Re-checking the file's existence is one remote stat per
+   step (~1-2 ms). At the observed ~64 steps per build this is noise; a build with
+   thousands of steps would notice. Throttle only with evidence.
+
+## How this was measured, so it can be repeated
+
+Build logs record every executed step, which is the only way to see inside the
+637 jobs whose Jenkinsfiles live in SCM. Jenkins prefixes each console line with
+a binary console note, so `grep '^\[Pipeline\]'` matches nothing — drop the
+anchor. Last 3 builds of every job is 690 logs and ~230 MB; run it `nice -n19
+ionice -c3` and off-hours.
 
 ---
 

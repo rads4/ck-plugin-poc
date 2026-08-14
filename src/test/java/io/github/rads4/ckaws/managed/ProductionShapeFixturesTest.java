@@ -156,6 +156,53 @@ class ProductionShapeFixturesTest {
         assertAdditionsOnly(STANDARD, generated);
     }
 
+    /**
+     * A key the section already declares is never written a second time.
+     *
+     * <p>Regression test for a production failure. {@code [profile ops]} carries
+     * {@code credential_source} but no {@code role_arn}; it was given the full assume-role triple,
+     * duplicating that key. botocore then refused to parse the <b>entire file</b> — so every profile in
+     * it failed, not just {@code ops}, and every AWS call in the build failed with
+     * <em>"Unable to parse config file"</em>. Worse than losing attribution, which is the one outcome
+     * this must never cause.
+     */
+    @Test
+    void aKeyTheSectionAlreadyDeclaresIsNeverWrittenTwice() {
+        String generated = describe(STANDARD, SELF_ROLE).content();
+
+        String ops =
+                generated.substring(generated.indexOf("[profile ops]"), generated.indexOf("[profile multi-tenant]"));
+
+        assertEquals(
+                1,
+                ops.split("credential_source", -1).length - 1,
+                "credential_source must appear exactly once in [profile ops]:\n" + ops);
+        assertTrue(ops.contains("role_arn = " + SELF_ROLE), "the role is still added");
+        assertTrue(ops.contains("role_session_name = " + SESSION), "and so is the session name");
+        assertEquals(
+                Optional.empty(),
+                AwsConfigOverlay.validate(STANDARD, generated),
+                "and the result must pass the safety check");
+    }
+
+    /** The safety check must catch a duplicate key even though it is, structurally, an addition. */
+    @Test
+    void theSafetyCheckRefusesADuplicateKey() {
+        String duplicated = "[profile ops]\n"
+                + "credential_source = Ec2InstanceMetadata\n"
+                + "region = us-east-1\n"
+                + "role_arn = " + SELF_ROLE + "\n"
+                + "credential_source = Ec2InstanceMetadata\n"
+                + "role_session_name = " + SESSION + "\n";
+        String original = "[profile ops]\ncredential_source = Ec2InstanceMetadata\nregion = us-east-1\n";
+
+        Optional<String> defect = AwsConfigOverlay.validate(original, duplicated);
+
+        assertTrue(defect.isPresent(), "a duplicated key must be refused");
+        assertTrue(defect.get().contains("credential_source"), defect.get());
+        assertTrue(defect.get().contains("twice"), defect.get());
+    }
+
     /** Without an unprofiled role configured, a no-role profile is still left completely alone. */
     @Test
     void aNamedProfileWithNoRoleIsUntouchedWhenNoUnprofiledRoleIsConfigured() {

@@ -82,6 +82,8 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
 
     private boolean diagnostics;
 
+    private boolean observeOnly;
+
     @NonNull
     private String credentialSource = DEFAULT_CREDENTIAL_SOURCE;
 
@@ -213,6 +215,34 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         save();
     }
 
+    /**
+     * Prepares everything and exports nothing.
+     *
+     * <p>The reason this exists: on 2026-08-08 an in-scope production build failed because the plugin
+     * <em>successfully</em> contributed something that displaced a credential binding. The fail-open
+     * guard never fired, because nothing threw. A guard that only catches exceptions cannot catch a
+     * correct-looking contribution that takes something away, and no amount of testing a plugin against
+     * job shapes someone imagined will find the shape nobody imagined.
+     *
+     * <p>So: turn this on, widen the scope to everything, and let a day of real traffic run. Every build
+     * reports the configuration it would have been given, the sections that would have been decorated
+     * and any problem found — while exporting nothing at all, so a build cannot observe the plugin and
+     * cannot be affected by it. Then read the evidence and turn it off.
+     *
+     * <p>This is the answer to "the master switch is the only safety net". It is not: the master switch
+     * is what you reach for after something breaks. This is how you find out beforehand, across every
+     * job that actually runs, without watching a queue all day.
+     */
+    public boolean isObserveOnly() {
+        return observeOnly;
+    }
+
+    @DataBoundSetter
+    public void setObserveOnly(boolean observeOnly) {
+        this.observeOnly = observeOnly;
+        save();
+    }
+
     @NonNull
     public String getCredentialSource() {
         return credentialSource;
@@ -239,6 +269,7 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         nodeLabelPattern = null;
         unprofiledRoleArn = null;
         diagnostics = false;
+        observeOnly = false;
         credentialSource = DEFAULT_CREDENTIAL_SOURCE;
         req.bindJSON(this, json);
         save();

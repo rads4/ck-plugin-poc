@@ -111,12 +111,21 @@ public final class AwsConfigOverlay {
         boolean pinned = false;
         boolean sawDefault = false;
         boolean defaultAttributed = false;
+        // Keys the current section already declares. A key written twice makes the whole file
+        // unparseable — not merely the section — so nothing already present may be written again.
+        Set<String> sectionKeys = new LinkedHashSet<>();
 
         for (int i = 0; i < lines.size(); i++) {
             Matcher header = SECTION.matcher(lines.get(i));
             if (header.matches()) {
                 Emission emission = emissionFor(
-                        currentSection, inSection, assumesRole, pinned, unprofiledRoleArn, credentialSource);
+                        currentSection,
+                        inSection,
+                        assumesRole,
+                        pinned,
+                        unprofiledRoleArn,
+                        credentialSource,
+                        sectionKeys);
                 if (emission.decorates() && currentSection != null) {
                     decorated.add(currentSection);
                     defaultAttributed |= DEFAULT_SECTION.equals(currentSection);
@@ -128,6 +137,7 @@ public final class AwsConfigOverlay {
                 inSection = true;
                 assumesRole = false;
                 pinned = false;
+                sectionKeys = new LinkedHashSet<>();
                 start = i;
                 continue;
             }
@@ -135,13 +145,14 @@ public final class AwsConfigOverlay {
                 Matcher assignment = ASSIGNMENT.matcher(lines.get(i));
                 if (assignment.matches()) {
                     String key = assignment.group(1).toLowerCase(Locale.ROOT);
+                    sectionKeys.add(key);
                     assumesRole |= ROLE_ARN.equals(key);
                     pinned |= ROLE_SESSION_NAME.equals(key);
                 }
             }
         }
-        Emission last =
-                emissionFor(currentSection, inSection, assumesRole, pinned, unprofiledRoleArn, credentialSource);
+        Emission last = emissionFor(
+                currentSection, inSection, assumesRole, pinned, unprofiledRoleArn, credentialSource, sectionKeys);
         if (last.decorates() && currentSection != null) {
             decorated.add(currentSection);
             defaultAttributed |= DEFAULT_SECTION.equals(currentSection);
@@ -190,7 +201,8 @@ public final class AwsConfigOverlay {
             boolean assumesRole,
             boolean pinned,
             @CheckForNull String unprofiledRoleArn,
-            String credentialSource) {
+            String credentialSource,
+            Set<String> sectionKeys) {
         if (!inSection || pinned) {
             return Emission.verbatim();
         }
@@ -203,7 +215,11 @@ public final class AwsConfigOverlay {
         // gets the same treatment. The principal ARN is unchanged — it is the agent's own role — so
         // permissions, and every resource policy that grants to that role, are unaffected.
         if (unprofiledRoleArn != null && isProfileSection(section)) {
-            return Emission.assumeRole(unprofiledRoleArn, credentialSource);
+            // Only what the section does not already declare. A section such as [profile ops] already
+            // carries credential_source; writing it a second time makes the ENTIRE file unparseable to
+            // botocore — every profile in it, not just this one — and every AWS call in the build then
+            // fails. Measured in production, on the first run with unprofiled attribution enabled.
+            return Emission.assumeRole(unprofiledRoleArn, credentialSource, sectionKeys);
         }
         return Emission.verbatim();
     }
@@ -219,22 +235,29 @@ public final class AwsConfigOverlay {
         @CheckForNull
         private final String credentialSource;
 
-        private Emission(boolean sessionName, @CheckForNull String roleArn, @CheckForNull String credentialSource) {
+        private final Set<String> alreadyPresent;
+
+        private Emission(
+                boolean sessionName,
+                @CheckForNull String roleArn,
+                @CheckForNull String credentialSource,
+                Set<String> alreadyPresent) {
             this.sessionName = sessionName;
             this.roleArn = roleArn;
             this.credentialSource = credentialSource;
+            this.alreadyPresent = alreadyPresent;
         }
 
         static Emission verbatim() {
-            return new Emission(false, null, null);
+            return new Emission(false, null, null, Set.of());
         }
 
         static Emission sessionNameOnly() {
-            return new Emission(true, null, null);
+            return new Emission(true, null, null, Set.of());
         }
 
-        static Emission assumeRole(String roleArn, String credentialSource) {
-            return new Emission(true, roleArn, credentialSource);
+        static Emission assumeRole(String roleArn, String credentialSource, Set<String> alreadyPresent) {
+            return new Emission(true, roleArn, credentialSource, alreadyPresent);
         }
 
         boolean decorates() {
@@ -248,10 +271,17 @@ public final class AwsConfigOverlay {
             if (roleArn == null) {
                 return List.of(ROLE_SESSION_NAME + " = " + session);
             }
-            return List.of(
-                    ROLE_ARN + " = " + roleArn,
-                    CREDENTIAL_SOURCE + " = " + credentialSource,
-                    ROLE_SESSION_NAME + " = " + session);
+            List<String> additions = new ArrayList<>(3);
+            if (!alreadyPresent.contains(ROLE_ARN)) {
+                additions.add(ROLE_ARN + " = " + roleArn);
+            }
+            if (!alreadyPresent.contains(CREDENTIAL_SOURCE)) {
+                additions.add(CREDENTIAL_SOURCE + " = " + credentialSource);
+            }
+            if (!alreadyPresent.contains(ROLE_SESSION_NAME)) {
+                additions.add(ROLE_SESSION_NAME + " = " + session);
+            }
+            return additions;
         }
     }
 
@@ -376,6 +406,40 @@ public final class AwsConfigOverlay {
             Set<String> missing = new LinkedHashSet<>(beforeSections);
             missing.removeAll(afterSections);
             return java.util.Optional.of("section(s) lost in the generated file: " + missing);
+        }
+        return duplicateKey(after);
+    }
+
+    /**
+     * Rejects a section that declares the same key twice.
+     *
+     * <p>"Additions only" is necessary and not sufficient. A duplicated key <em>is</em> an addition, so
+     * the structural check passes — while botocore refuses to parse the file at all, failing every
+     * profile in it and therefore every AWS call in the build. That is worse than losing attribution,
+     * which is the one outcome this plugin must never cause.
+     *
+     * <p>Found in production: a profile carrying {@code credential_source} but no {@code role_arn} was
+     * given the full assume-role triple, duplicating the key it already had.
+     */
+    @NonNull
+    private static java.util.Optional<String> duplicateKey(List<String> lines) {
+        String section = "";
+        Set<String> keys = new LinkedHashSet<>();
+        for (String line : lines) {
+            Matcher header = SECTION.matcher(line);
+            if (header.matches()) {
+                section = header.group(1).trim();
+                keys = new LinkedHashSet<>();
+                continue;
+            }
+            Matcher assignment = ASSIGNMENT.matcher(line);
+            if (assignment.matches()) {
+                String key = assignment.group(1).toLowerCase(Locale.ROOT);
+                if (!keys.add(key)) {
+                    return java.util.Optional.of("the generated file declares '" + key + "' twice in [" + section
+                            + "], which makes the whole file unparseable");
+                }
+            }
         }
         return java.util.Optional.empty();
     }
