@@ -62,6 +62,61 @@ making "the controller says 2.0" meaningless — but the fix is to pin the numbe
 
 ---
 
+# ⚠️ PRE-INSTALL CHECKLIST — read before touching infra Jenkins
+
+Infra Jenkins is installed to **exactly once**. Work through this first; every item
+below is something that was learned the hard way, not a precaution.
+
+### 1. Install the binary that was actually tested — do not rebuild
+
+`.hpi` jars embed build timestamps, so **`mvn clean verify` on unchanged source
+produces a different `sha256` every time.** The validated artifact is
+`f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523` — the binary every
+canary, all 7 agent types and `dev2/fluentd #119` ran against.
+
+A local `mvn clean` has since deleted it. **The only surviving copy is on
+`poc-jenkins-2` (`i-0cdd407bce366be0f`) at `/var/lib/jenkins/plugins/ck-aws.hpi`** —
+retrieve it from there. Rebuilding instead is defensible (identical source, 220 tests
+green) but then say so plainly: the shipped hash was never the one under test.
+Never run `mvn clean` while a validated artifact is the only copy.
+
+### 2. Settings to apply at install time
+
+| Field | Value | Why |
+|---|---|---|
+| *Managed authentication* | **off** at first | Install and restart with it off; turn on afterwards without a restart |
+| *Apply to jobs matching* | blank | Observe-only makes full scope safe |
+| *Except jobs matching* | blank | Reserved as the incident switch |
+| *Apply on nodes labelled* | blank | Unused |
+| *Attribute unprofiled calls as* (static ARN) | **BLANK** | Deprecated footgun — a wrong value breaks every bare `aws` call |
+| *…as the node's own instance role* | **ticked** | This is what audits ~98% |
+| *AWS profiles* | empty | Never once used |
+| *Observe only* | **ticked** | Enforce only after reading a day of real traffic |
+| *Diagnostics* | ticked | Turn off once the rollout is settled |
+
+### 3. Rollout order
+
+Install with the switch **off** → restart (the one restart) → switch **on** with
+observe-only → read a day of console evidence → untick observe-only.
+
+### 4. Accept these three known limits before starting
+
+- **3 of 802 jobs** (`cln-app-terraform-pipeline`, `ck-analytics-app-services-terraform`,
+  `ck-ecs-terraform`) have provider-level `assume_role`; their post-hop calls carry
+  `aws-go-sdk-<nanotime>` and are traceable only transitively. No plugin-side fix exists.
+- A node whose role AWS will not let self-assume stays **unattributed but working**.
+- **Two job types were never run under 2.2**: a Freestyle job that really calls AWS, and
+  an inline Pipeline that really calls AWS. Both code paths are test-locked and the
+  Freestyle path is additive (it cannot shadow), but neither has live evidence.
+
+### 5. Set up gap detection after the install
+
+Log recorder on `io.github.rads4.ckaws` at WARNING, plus the CloudTrail session-name
+buckets. See *Detecting unaudited calls automatically* below. Deferred by decision, but
+without it nothing reports centrally.
+
+---
+
 # v2.0 (2026-08-07)
 
 ## M12i is closed: the plugin was not the cause

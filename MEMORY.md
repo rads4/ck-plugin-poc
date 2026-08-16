@@ -10,6 +10,7 @@
 |---|---|
 | **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is being audited today. Infra has not been restarted, reconfigured or installed to at any point |
 | **Shipping build** | **2.2**, `sha256 f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523`, 220 tests. Every earlier 2.2/2.3/2.4 hash is void |
+| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. The validated `f5150ba3` binary was deleted locally by `mvn clean`; the only copy is on `poc-jenkins-2` at `/var/lib/jenkins/plugins/ck-aws.hpi`. Rebuilding gives a different hash from identical source — see addendum 10 |
 | **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f`, `10.20.80.237` — built from a post-migration AMI, running 2.2. See `poc-jenkins-setup/STATE.md` |
 
 ### What 2.2 contains beyond 2.1
