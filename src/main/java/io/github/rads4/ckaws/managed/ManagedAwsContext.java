@@ -98,10 +98,40 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
     static final String SESSION_VARIABLE = "CK_AWS_SESSION_NAME";
 
     /**
+     * The standard AWS variable for naming an assumed-role session, exported so that a tool which
+     * assumes a role <em>itself</em> still names the session after the build.
+     *
+     * <p><b>Why this is needed.</b> The generated configuration names the session for every role the
+     * shared config assumes, which covers the AWS CLI, boto3 and Terraform's default credential
+     * resolution. It does not cover a <em>second</em> hop performed by the tool: a Terraform provider
+     * carrying its own {@code assume_role} block assumes a further role from the already-assumed
+     * session and, with no {@code session_name} in that block, the provider picks the name. Those
+     * calls - the ones that actually change infrastructure - then carry a generated name rather than
+     * {@code jk-<job>-<build>}, and CloudTrail only ties them back through the AssumeRole event.
+     *
+     * <p>Setting this variable is the only fix that needs no change to any repository: every AWS SDK
+     * reads it, so the second hop is named without editing a single {@code .tf} file, Jenkinsfile or
+     * shared library. That matters because the entire premise of this plugin is that a build is
+     * attributed without anyone having to remember anything.
+     *
+     * <p>It is contributed like everything else - as an addition. A job that sets
+     * {@code AWS_ROLE_SESSION_NAME} itself keeps its own value, because the merge expands the
+     * plugin's values first and the enclosing environment wins.
+     */
+    static final String ROLE_SESSION_NAME_VARIABLE = "AWS_ROLE_SESSION_NAME";
+
+    /**
      * One monitor per prepared key, so concurrent branches sharing a workspace prepare it once between
      * them rather than racing to write the same file. Evicted with {@link #PREPARED}.
      */
     private static final Map<String, Object> LOCKS = new ConcurrentHashMap<>();
+
+    /**
+     * Each node's own instance-role ARN, resolved once per node. A node's instance profile does not
+     * change while it is attached, and a replaced agent gets a new node name, so this cannot go stale.
+     * Only successful resolutions are cached: a node that has no profile today may be given one.
+     */
+    private static final Map<String, String> NODE_ROLE_ARNS = new ConcurrentHashMap<>();
 
     @Override
     protected Class<EnvironmentExpander> type() {
@@ -189,13 +219,15 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             return null;
         }
 
+        // buildWorkspace can return its own @CheckForNull argument, so its result is nullable to an
+        // analyser even though `current` was checked above. Bind and re-check rather than suppress.
+        FilePath workspace = buildWorkspace(current, node, run);
+        if (workspace == null) {
+            return null;
+        }
+
         Map<String, String> variables = prepareOnce(
-                run,
-                buildWorkspace(current, node, run),
-                node,
-                context.get(Computer.class),
-                configuration,
-                context.get(TaskListener.class));
+                run, workspace, node, context.get(Computer.class), configuration, context.get(TaskListener.class));
         if (variables == null) {
             return null;
         }
@@ -223,7 +255,77 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         EnvironmentExpander ours = EnvironmentExpander.constant(variables);
         EnvironmentExpander existing = context.get(EnvironmentExpander.class);
         // merge() null-checks only its first argument; passing null as the second NPEs on expand.
-        return existing == null ? ours : EnvironmentExpander.merge(ours, existing);
+        if (existing == null) {
+            return ours;
+        }
+        EnvironmentExpander merged = EnvironmentExpander.merge(ours, existing);
+
+        // ADDITIONS-ONLY INVARIANT, checked at runtime rather than argued from the merge order.
+        //
+        // The ordering above is correct by construction, but "correct by construction" is exactly the
+        // claim that failed for dev2/rivon: the guard only caught exceptions, and a contribution that
+        // succeeds while quietly removing something throws nothing. The config-file surface has had a
+        // runtime check since M12 (AwsConfigOverlay#validate); this is its counterpart for the
+        // environment, and it closes the asymmetry that let rivon ship.
+        //
+        // It also covers the one thing merge ordering cannot: this depends on DelegatedContext#get
+        // returning the enclosing expander faithfully. If it ever returns null, a partial view, or a
+        // different level than expected - in a nesting shape nobody has written yet - the merge is
+        // built from the wrong base and the ordering argument silently no longer holds. Comparing the
+        // actual expansions needs no such assumption, so an unimagined shape fails safe instead of
+        // failing silently. That is what makes future jobs safe without enumerating them.
+        String loss = wouldRemoveSomething(existing, merged);
+        if (loss != null) {
+            warn(context.get(TaskListener.class), "not contributing: " + loss);
+            LOGGER.log(Level.WARNING, "ck-aws declined to contribute: {0}", loss);
+            // null means "this DynamicContext has no answer", so resolution continues to the enclosing
+            // level and the build gets its own environment untouched. Losing attribution is acceptable;
+            // changing a variable the build set is not.
+            return null;
+        }
+        return merged;
+    }
+
+    /**
+     * Whether contributing would remove or alter any variable this plugin does not own.
+     *
+     * <p>Both sides are expanded from an empty {@link EnvVars}, so the comparison is strictly "what
+     * the enclosing environment sets" against "what the merged environment sets" - not a diff against
+     * the whole build environment.
+     *
+     * <p>Every variable the enclosing block sets must survive unchanged - including the two this
+     * plugin owns. There is no exemption for them: {@code merge(ours, existing)} expands ours first,
+     * so for any key both sides set, the enclosing value is the one that survives. A job that sets its
+     * own {@code AWS_CONFIG_FILE} keeps it, because a value a job chose is not a default.
+     *
+     * <p>Returns {@code null} when the contribution is purely additive, or a short description of the
+     * first violation otherwise. Variable <em>names</em> appear in that description; <em>values</em>
+     * never do, because an enclosing {@code withCredentials} expands secrets into this map.
+     *
+     * <p>Package-private so the invariant can be tested directly, without having to construct a
+     * nesting shape that provokes a violation through a real pipeline.
+     *
+     * @param existing the environment published by the enclosing context level
+     * @param merged   what this plugin proposes to publish instead
+     */
+    @CheckForNull
+    static String wouldRemoveSomething(@NonNull EnvironmentExpander existing, @NonNull EnvironmentExpander merged)
+            throws IOException, InterruptedException {
+        EnvVars before = new EnvVars();
+        existing.expand(before);
+        EnvVars after = new EnvVars();
+        merged.expand(after);
+        for (Map.Entry<String, String> entry : before.entrySet()) {
+            String name = entry.getKey();
+            String now = after.get(name);
+            if (now == null) {
+                return "the enclosing block sets " + name + ", which this plugin's contribution would drop";
+            }
+            if (!now.equals(entry.getValue())) {
+                return "the enclosing block sets " + name + ", which this plugin's contribution would change";
+            }
+        }
+        return null;
     }
 
     /**
@@ -379,7 +481,7 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
                 sessionName,
                 overrides,
                 configuration.getCredentialSource(),
-                configuration.getUnprofiledRoleArn());
+                unprofiledRoleArnFor(configuration, workspace, node, listener));
         String decorated = result.content();
 
         // The guard around this method catches exceptions; it cannot catch "produced a wrong file
@@ -418,12 +520,26 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
                             + (nodeConfigFile == null ? "" : " (from " + nodeConfigFile.getRemote() + ")")
                             + (result.unprofiledAttributed() ? "; calls naming no profile are attributed too" : ""));
             if (configuration.isDiagnostics() || SystemProperties.getBoolean(DIAGNOSTICS_PROPERTY)) {
-                diagnose(listener, computer, nodeConfigFile, nodeConfig, result, config, sessionName);
+                diagnose(
+                        listener,
+                        computer,
+                        nodeConfigFile,
+                        nodeConfig,
+                        result,
+                        config,
+                        sessionName,
+                        configuration.isObserveOnly());
             }
         }
 
         // AWS_SHARED_CREDENTIALS_FILE is deliberately absent: see the class javadoc.
-        return Map.of(CONFIG_VARIABLE, config.getRemote(), SESSION_VARIABLE, sessionName);
+        return Map.of(
+                CONFIG_VARIABLE,
+                config.getRemote(),
+                SESSION_VARIABLE,
+                sessionName,
+                ROLE_SESSION_NAME_VARIABLE,
+                sessionName);
     }
 
     /**
@@ -439,8 +555,15 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             String nodeConfig,
             AwsConfigOverlay.Result result,
             FilePath writtenTo,
-            String sessionName) {
+            String sessionName,
+            boolean observeOnly) {
         java.io.PrintStream out = listener.getLogger();
+        // In observe-only these variables are NOT exported, so they must not be reported as
+        // though they were. The headline line already says "nothing exported"; a diagnostics
+        // block that then says "exported AWS_CONFIG_FILE: ..." contradicts it. That matters
+        // because observe-only exists precisely so its output can be READ and trusted while
+        // surveying every job before enforcing.
+        String verb = observeOnly ? "would export" : "exported";
         out.println("[ck-aws] --- diagnostics ---");
         EnvVars environment = new EnvVars();
         if (computer != null) {
@@ -462,8 +585,9 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         out.println("[ck-aws]   " + pad("sections decorated") + ": " + result.sectionsDecorated());
         out.println("[ck-aws]   " + pad("sections appended") + ": " + result.sectionsAppended());
         out.println("[ck-aws]   " + pad("written to") + ": " + writtenTo.getRemote());
-        out.println("[ck-aws]   " + pad("exported AWS_CONFIG_FILE") + ": " + writtenTo.getRemote());
-        out.println("[ck-aws]   " + pad("exported CK_AWS_SESSION_NAME") + ": " + sessionName);
+        out.println("[ck-aws]   " + pad(verb + " AWS_CONFIG_FILE") + ": " + writtenTo.getRemote());
+        out.println("[ck-aws]   " + pad(verb + " CK_AWS_SESSION_NAME") + ": " + sessionName);
+        out.println("[ck-aws]   " + pad(verb + " AWS_ROLE_SESSION_NAME") + ": " + sessionName);
         out.println("[ck-aws]   " + pad("AWS_SHARED_CREDENTIALS_FILE") + ": not set by this plugin");
         out.println("[ck-aws] --- end diagnostics ---");
     }
@@ -480,6 +604,193 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      * been told where its configuration lives has already answered this question; otherwise
      * {@code $HOME/.aws/config}, which is what every AWS SDK would have used.
      */
+    /**
+     * The role the generated {@code [default]} should assume: a fixed ARN, or the node's own.
+     *
+     * <p>A single configured ARN is only correct while every agent shares one instance role. Hand a
+     * node a {@code role_arn} it may not assume and its unprofiled {@code aws} calls <em>fail</em>
+     * rather than merely going unattributed — the one way this feature can break a build, and it would
+     * show up first on a node nobody tested. Resolving per node removes that failure mode for agents
+     * that do not exist yet.
+     *
+     * <p>Fail-safe in both directions: an unresolvable node returns {@code null}, which means no
+     * {@code [default]} is written and unprofiled calls are left exactly as the node had them.
+     */
+    @CheckForNull
+    static String unprofiledRoleArnFor(
+            CkAwsGlobalConfiguration configuration,
+            FilePath workspace,
+            @CheckForNull Node node,
+            @CheckForNull TaskListener listener)
+            throws InterruptedException {
+        if (!configuration.isAttributeUnprofiledAsNodeRole()) {
+            return configuration.getUnprofiledRoleArn();
+        }
+        String nodeName = node == null ? "" : node.getNodeName();
+        String cached = NODE_ROLE_ARNS.get(nodeName);
+        if (cached != null) {
+            return cached;
+        }
+        String resolved;
+        try {
+            resolved = workspace.act(new ResolveNodeRoleArn());
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception | LinkageError e) {
+            LOGGER.log(Level.FINE, e, () -> "ck-aws: could not resolve the instance role of " + nodeName);
+            resolved = null;
+        }
+        if (resolved == null) {
+            warn(
+                    listener,
+                    "this node reports no instance role over IMDS, so calls naming no profile are left "
+                            + "exactly as the node had them");
+            return null;
+        }
+        NODE_ROLE_ARNS.put(nodeName, resolved);
+        return resolved;
+    }
+
+    /**
+     * Asks the node it runs on for its own instance role, over IMDSv2.
+     *
+     * <p>Runs on the agent, not the controller: the controller's own role is irrelevant, and an agent
+     * cannot be asked about its identity from anywhere else. Returns {@code null} for every failure —
+     * no instance profile, IMDS disabled, hop limit too low, not EC2 at all — because every one of
+     * those means "leave unprofiled calls alone".
+     */
+    private static final class ResolveNodeRoleArn extends jenkins.MasterToSlaveFileCallable<String> {
+
+        private static final long serialVersionUID = 1L;
+
+        /** {@code arn:aws:iam::123456789012:instance-profile/name} — partition and account. */
+        private static final java.util.regex.Pattern PROFILE_ARN =
+                java.util.regex.Pattern.compile("arn:(aws[a-zA-Z-]*):iam::(\\d+):instance-profile/");
+
+        private static final String IMDS = "http://169.254.169.254/latest/";
+
+        @Override
+        @CheckForNull
+        public String invoke(java.io.File directory, hudson.remoting.VirtualChannel channel) {
+            try {
+                String token = token();
+                String roleName = read(token, "meta-data/iam/security-credentials/");
+                if (roleName == null || roleName.isBlank()) {
+                    return null;
+                }
+                // The listing is one role name per line; an instance has exactly one.
+                roleName = roleName.split("\\R")[0].trim();
+
+                String info = read(token, "meta-data/iam/info");
+                if (info == null) {
+                    return null;
+                }
+                java.util.regex.Matcher matcher = PROFILE_ARN.matcher(info);
+                if (!matcher.find()) {
+                    return null;
+                }
+                // The instance profile carries the partition and account; the role NAME comes from the
+                // credentials listing. A profile and its role often differ in name, so both are needed.
+                String roleArn = "arn:" + matcher.group(1) + ":iam::" + matcher.group(2) + ":role/" + roleName;
+
+                // Naming the right role is not enough: AWS must also PERMIT the role to assume itself,
+                // which needs its own identity policy to allow sts:AssumeRole on its own ARN. If it does
+                // not, writing role_arn would make every unprofiled `aws` call in the build fail with
+                // AccessDenied — turning "not audited" into "broken", on a node nobody tested.
+                //
+                // So prove it before claiming it. One STS call per node, cached by the caller. A refusal
+                // returns null, which means no [default] is written and unprofiled calls are left
+                // exactly as the node had them: unattributed, and working.
+                return canAssumeItself(roleArn) ? roleArn : null;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        /**
+         * Whether this node may actually re-issue its own role. Runs {@code aws sts assume-role} on the
+         * node, because that is the only authority on the answer: the trust policy, the role's identity
+         * policy, SCPs and permission boundaries all get a vote, and simulating them is not the same as
+         * being allowed.
+         *
+         * <p>The probe session name is deliberately not a {@code jk-} name — it is not a build.
+         */
+        private static boolean canAssumeItself(String roleArn) {
+            Process process = null;
+            try {
+                String executable = System.getProperty("io.github.rads4.ckaws.awsExecutable", "aws");
+                process = new ProcessBuilder(
+                                executable,
+                                "sts",
+                                "assume-role",
+                                "--role-arn",
+                                roleArn,
+                                "--role-session-name",
+                                "ck-aws-selfassume-probe",
+                                "--duration-seconds",
+                                "900",
+                                "--query",
+                                "Credentials.AccessKeyId",
+                                "--output",
+                                "text")
+                        .redirectErrorStream(true)
+                        .start();
+                if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    return false;
+                }
+                if (process.exitValue() != 0) {
+                    return false;
+                }
+                try (java.io.InputStream in = process.getInputStream()) {
+                    String out = new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+                    // An access key id, not an error message.
+                    return out.startsWith("ASIA") || out.startsWith("AKIA");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (IOException | RuntimeException e) {
+                // No aws CLI on the node, or it could not be executed. Fail safe.
+                return false;
+            } finally {
+                if (process != null) {
+                    process.destroy();
+                }
+            }
+        }
+
+        private static String token() throws IOException {
+            java.net.HttpURLConnection c =
+                    (java.net.HttpURLConnection) new java.net.URL(IMDS + "api/token").openConnection();
+            c.setRequestMethod("PUT");
+            c.setRequestProperty("X-aws-ec2-metadata-token-ttl-seconds", "60");
+            c.setConnectTimeout(2000);
+            c.setReadTimeout(2000);
+            try (java.io.InputStream in = c.getInputStream()) {
+                return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+            }
+        }
+
+        @CheckForNull
+        private static String read(String token, String path) {
+            try {
+                java.net.HttpURLConnection c =
+                        (java.net.HttpURLConnection) new java.net.URL(IMDS + path).openConnection();
+                c.setRequestProperty("X-aws-ec2-metadata-token", token);
+                c.setConnectTimeout(2000);
+                c.setReadTimeout(2000);
+                try (java.io.InputStream in = c.getInputStream()) {
+                    return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                }
+            } catch (IOException | RuntimeException e) {
+                // 404 (no instance profile), connect timeout (IMDS disabled or hop limit too low),
+                // or not EC2 at all. Every one of them means "leave unprofiled calls alone".
+                return null;
+            }
+        }
+    }
+
     @CheckForNull
     private static FilePath locateNodeConfig(@CheckForNull Node node, @CheckForNull Computer computer) {
         String override = SystemProperties.getString(CONFIG_PATH_PROPERTY);

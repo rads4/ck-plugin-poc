@@ -1,3 +1,67 @@
+# ck-aws — session memory
+
+> **READ THIS BLOCK FIRST.** Everything below it is session-by-session history, oldest
+> first, and it is long. This block is the current state; consult the history only when
+> you need the reasoning behind a specific decision.
+
+## Current state — 2026-08-16
+
+| | |
+|---|---|
+| **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is being audited today. Infra has not been restarted, reconfigured or installed to at any point |
+| **Shipping build** | **2.2**, `sha256 f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523`, 220 tests. Every earlier 2.2/2.3/2.4 hash is void |
+| **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f`, `10.20.80.237` — built from a post-migration AMI, running 2.2. See `poc-jenkins-setup/STATE.md` |
+
+### What 2.2 contains beyond 2.1
+
+1. Four defect fixes — context shadowing (the rivon defect), workspace anchoring, stale
+   memo after a mid-build clean, parallel write race
+2. **Runtime additions-only invariant on the environment** — the layer that makes
+   *unwritten* jobs safe, not just known ones
+3. **Observe-only mode** — prepare, decorate, validate, report, export nothing
+4. **Per-node unprofiled attribution** — each node's own instance role, resolved over
+   IMDS, with a real `sts:AssumeRole` probe first so a node that may not self-assume is
+   left working-and-unattributed rather than broken
+5. **`AWS_ROLE_SESSION_NAME` exported** — best-effort fix for the Terraform second hop
+
+### Proven
+
+- 13 canaries green on the clone; 6 real production agent AMIs, 5/5 each
+- Every context shape covering ~99% of 46,446 production `sh` calls, incl. all 19
+  `withCredentials`+`dir` variants and `withSonarQubeEnv`
+- All three `~/.aws/config` shapes; three `aws` CLI versions; two architectures
+- **Audit works**: 7 real `jk-<job>-<build>` sessions in CloudTrail from POC builds
+- **Fail-safe works on a real node**: an agent whose role AWS refuses to let self-assume
+  got no `[default]`, stayed unattributed, and its build still passed
+- Complete *static* coverage: 490 pipeline files across every branch of 20 Bitbucket
+  repos contain **no** JVM-side AWS step, so nothing bypasses `AWS_CONFIG_FILE`
+- **A real production job, end to end**: `dev2/fluentd #119` deployed for real from the
+  clone and produced **35 CloudTrail events across two accounts, all `jk-dev2-fluentd-119`**
+  — closing the SCM-backed-pipeline path (639 jobs) and exercising *both* attribution
+  routes in one build (decorated profile, and profile-less ECR via `[default]` self-assume)
+
+### Not proven / known open
+
+- **Terraform second hop — measured and closed as unfixable from the plugin.** The
+  provider ignores `AWS_ROLE_SESSION_NAME` and generates `aws-go-sdk-<nanotime>`.
+  Affects **3 of 802 jobs**; their post-hop calls are traceable only transitively, via
+  the `jk-` session CloudTrail records as the *caller* of that AssumeRole
+- Untested job types: a **Freestyle job that really calls AWS**, and an **inline
+  Pipeline that really calls AWS** (`cloud-cost-ck` ran green but makes no AWS calls at
+  all, so it produced no audit evidence)
+- Nodes whose role AWS will not let self-assume stay unattributed — fail-safe, by design
+- **No central reporting exists.** Observe-only records to the build console only; see
+  addendum 9 for the two-mechanism design (Jenkins log recorder + CloudTrail session-name
+  buckets), deferred until after the infra install
+
+### Standing constraints
+
+Infra Jenkins is installed to exactly **once**, at the end. No repo changes, ever — the
+plugin must attribute without any job being edited. No Terraform runs against real AWS
+from the POC. Never print secrets.
+
+---
+
 # MEMORY.md
 
 Session-by-session implementation log. Architecture lives in [CLAUDE.md](CLAUDE.md) —
@@ -2622,3 +2686,347 @@ Consequences recorded for the plan:
 3. The **structural additions-only invariant** matters more under this rule than it
    did before: enumeration cannot cover jobs whose definitions live in SCM, so the
    plugin must refuse to contribute when any variable it does not own would change.
+
+### Session 24 addendum 2 — the additions-only environment invariant is IN 2.2
+
+Rads' decision, and the reasoning that forced it: the goal is that **every job,
+including ones not yet written, is audited without any job failing**, and that infra
+Jenkins is restarted exactly once. Those two together mean the structural invariant
+cannot be deferred to a later version — deferring it buys a second restart.
+
+**What was added.** `ManagedAwsContext.wouldRemoveSomething(existing, merged)`
+expands the enclosing `EnvironmentExpander` and the merged one the plugin proposes,
+from an empty `EnvVars` each, and compares. If any variable the enclosing block set
+would be dropped or altered, `contribute()` returns `null` — resolution continues to
+the enclosing level and the build keeps its own environment untouched. Variable
+*names* are reported; *values* never are, because an enclosing `withCredentials`
+expands secrets into that map.
+
+**Why the previous approach was not enough.** The merge order (`merge(ours,
+existing)`, so the enclosing value always wins) is correct — but "correct by
+construction" is precisely the claim that failed for rivon. More concretely, the
+ordering argument assumes `DelegatedContext.get` returns the enclosing expander
+faithfully. If it ever returns null, a partial view, or a different level — in a
+nesting shape nobody has written — the merge is built from the wrong base and the
+argument silently stops holding, with nothing thrown and nothing logged. Comparing
+actual expansions makes no such assumption.
+
+There is deliberately **no exemption for the plugin's own two variables**. Since
+`merge(ours, existing)` expands ours first, the enclosing value wins for any
+overlapping key, so a job that sets its own `AWS_CONFIG_FILE` keeps it. Checking
+every key is both simpler and stricter.
+
+**Also fixed while building:** SpotBugs flagged `buildWorkspace(...)` as a possibly
+null return (it can return its own `@CheckForNull` argument) feeding `prepareOnce`.
+Bound to a local and re-checked rather than suppressed.
+
+**215 tests, 0 failures, 1 skipped.** Five new in `AdditionsOnlyEnvironmentTest`,
+including a reduction of the rivon defect to its essence — an expander that answers
+with only the plugin's own variables is now rejected.
+
+⚠️ **The shipping hash has changed.**
+
+| build | sha256 | status |
+|---|---|---|
+| **2.2 (shipping)** | `edde1e04d5e5415b1ea05d73e5f29e283f9b70072cbb6194f4aa7c1959817ef9` | **the only installable artifact** |
+| old 2.2 | `b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45` | void — no environment invariant |
+| older 2.2 | `fa854a3d4f0ffeea8d6250942801b2939e4d64e4dec8021e9f051fe2f98bafdd` | void — shadowing defect |
+| old 2.3 | `728d1eb411b1c01462cea4e618ccf993671fe31348090e0d568b3282d0469856` | void |
+| old 2.4 | `47b8f3ae192c3d8742cd66e1e1e3751c179bf28807426605b461725f3474805e` | void |
+
+The number stays **2.2** because no 2.2 has ever been *installed* on a controller,
+and versions track installations, not builds. 2.1 remains what is on infra.
+
+### Session 24 addendum 3 — observe-only reporting defect, found by using it
+
+The observe-only sweep on the POC clone passed functionally: scope widened to `.*`
+(all 782 jobs), `observeOnly=true`, and both a canary and a real job
+(`Cost-report-ck-Devops-Infra-MAV` #118, SUCCESS 3m09s) confirmed **nothing was
+exported** and the build's own environment was untouched.
+
+But the diagnostics block still printed:
+
+```
+[ck-aws] OBSERVE ONLY, nothing exported: would decorate as session jk-...
+[ck-aws]   exported AWS_CONFIG_FILE      : /home/pocagent/workspace/...@tmp/ck-aws/config
+[ck-aws]   exported CK_AWS_SESSION_NAME  : jk-...
+```
+
+The headline says nothing was exported; the next two lines say it was. Functionally
+harmless — the canary proved nothing is exported — but observe-only exists **precisely
+so its output can be read and trusted** while surveying every job before enforcing.
+Output that contradicts itself defeats the feature. `diagnose()` now takes the
+observe-only flag and prints "would export" instead.
+
+Found by using the feature rather than by reading the code, which is the same lesson
+as rivon.
+
+⚠️ **Shipping hash changed again.**
+
+| build | sha256 | status |
+|---|---|---|
+| **2.2 (shipping)** | `4cc0aadafddd4b0f274617eb0bc0169bcd9167309439885a5712aa8b427ae798` | **the only installable artifact** |
+| edde1e04… | `edde1e04d5e5415b1ea05d73e5f29e283f9b70072cbb6194f4aa7c1959817ef9` | void — misleading observe-only diagnostics |
+| b4c94c78… | `b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45` | void — no environment invariant |
+| fa854a3d… / 728d1eb4… / 47b8f3ae… | (earlier 2.2 / 2.3 / 2.4) | void |
+
+215 tests, 0 failures. Still version 2.2 — no 2.2 has ever been installed on a
+controller, and versions track installations, not builds.
+
+### Session 24 addendum 4 — the audit gap, and per-node unprofiled resolution
+
+**The gap.** A census of 684 build logs: `aws` with **no profile** appears **16,378
+times across 398 jobs**; `aws --profile X` only **370 times across 26 jobs**. So ~98% of
+AWS calls resolved to the node's instance role, whose session name EC2 fixes to the
+instance id — unattributable. The plugin was auditing ~2% of AWS activity.
+
+This was **not a missing feature**. `unprofiledRoleArn` has existed since v2.0. It was
+blank because nobody had verified the instance role may assume *itself* — and if it may
+not, enabling it makes every bare `aws` call fail. Verified read-only before touching
+anything: trust policy includes `685502069032:root`, and
+`iam simulate-principal-policy` for `sts:AssumeRole` on its own ARN returns **allowed**.
+
+**Proven** with a real bare `aws sts get-caller-identity` on a real EC2 agent:
+`.../i-0a237b1d7c86f57a5` → `.../jk-poc-canary-audit-real-2`. The principal ARN is
+unchanged, only the session name differs, so resource policies keep working.
+
+**The long-term fix.** A single ARN is right only while every agent shares one instance
+role — true today (all 25 EC2 templates) but not guaranteed. A new agent with a
+different role would be handed a `role_arn` it cannot assume and its unprofiled calls
+would **fail**. New setting `attributeUnprofiledAsNodeRole` resolves each node's own
+role over IMDS at prepare time, via a `MasterToSlaveFileCallable` that runs **on the
+node**. Fail-safe: unresolvable node → `null` → no `[default]` written → today's
+behaviour. Cached per node name.
+
+Verified with a **negative control**: the static ARN was set to
+`arn:aws:iam::999999999999:role/this-role-does-not-exist` and the checkbox turned on.
+If the fixed value had been used, every bare call would have failed. Both agents instead
+resolved their own role and produced `jk-*` sessions. **20/20 canaries passed.**
+
+What this still cannot check: whether a node's role is *permitted* to self-assume. The
+help text documents the `simulate-principal-policy` check for that.
+
+⚠️ **Shipping hash changed.** Only
+`b4ec751e2f36bc5b8b7d4f81e5b44a0bb77043df7a810cf4382f5faef3119b07` may be installed.
+Void: `4cc0aada…`, `edde1e04…`, `b4c94c78…`, `fa854a3d…`, `728d1eb4…`, `47b8f3ae…`.
+220 tests, 0 failures. Still version 2.2 — no 2.2 has ever been installed.
+
+### Session 24 addendum 5 — self-assume probe, and the limits of enumeration
+
+**The fallback.** Per-node resolution names the right role, but AWS must also *permit*
+the role to assume itself. If it does not, writing `role_arn` turns "unattributed" into
+"the build fails" — the one remaining way this feature could break something, on a node
+nobody had tested.
+
+Two designs were considered. A `credential_process` wrapper that self-assumes and falls
+back to raw IMDS credentials is the most robust, but it would rewrite the `[default]`
+emission inside `AwsConfigOverlay` — the most heavily validated code in the plugin — and
+needs JSON reshaping in POSIX sh. Chosen instead: **prove it before claiming it.** The
+node-side callable runs `aws sts assume-role` against its own ARN once per node; on
+refusal it returns `null`, so no `[default]` is written at all. Same safety outcome,
+contained entirely within the new code, `AwsConfigOverlay` untouched.
+
+Session name for the probe is `ck-aws-selfassume-probe` — deliberately not a `jk-` name,
+because it is not a build. It appears once per node in CloudTrail.
+
+**Enumeration limits, measured.** 802 jobs: **602 have build history, 200 do not**, so
+the build-log census saw 75%. Static scanning of job configs closes most of it:
+
+- **Freestyle (41 jobs): every build step is `hudson.tasks.Shell`.** Nothing else.
+- **Inline Pipelines (118 jobs): statically scanned** — no `withAWS`, `s3Upload`,
+  `ecrLogin`, `cfnUpdate` or `invokeLambda` anywhere.
+- **All 45 distinct Pipeline steps used in production: none calls AWS directly.** Every
+  AWS call goes through a shell, which is exactly what `AWS_CONFIG_FILE` covers. Had any
+  job used a JVM-side AWS step, the plugin would neither audit nor affect it — a silent
+  hole. There are none.
+
+Remaining gap: **165 SCM pipelines with no build history**, whose Jenkinsfiles live in
+Bitbucket and have never been seen. A repo scan closes it.
+
+**Two agent templates have NO instance profile** — `jenkins-slave-non-prod-aispl` and
+`non-prod-rds-restore-slave`. Their AWS calls are unattributable and **no plugin change
+can fix that**; it needs an instance profile attached. With per-node resolution they are
+left alone rather than broken.
+
+⚠️ Shipping hash: `7f02b6542c378777f9273cf1d565f4724bba4d140172c361121d8741994c2a1e`.
+220 tests. 20/20 canaries pass with the probe in place.
+
+### Session 24 addendum 6 — complete static coverage via Bitbucket
+
+The build-log census could only see jobs that had run (602 of 802). The remaining
+**165 SCM pipelines had no build history**, and their Jenkinsfiles had never been read
+by anything. Closed by scanning Bitbucket directly.
+
+**Method.** A read-only Jenkins job on the POC clone (`poc-scan-bitbucket`) using the
+existing `CKBitbucket` credential natively — no key extraction, no push. Bare, blobless
+clones of all 20 referenced repos, then `git ls-tree` across **every branch** and
+`git show` for each Jenkinsfile and `vars/*.groovy`, deduplicated by blob sha.
+
+First attempt found only 7 files: a shallow default-branch clone. CloudKeeper's
+Jenkinsfiles live on per-environment branches — `cln-deployment-scripts` alone has
+**337 branches**, `stormus` has 5,371. Scanning all branches found **490 unique
+pipeline files**.
+
+**Result 1 — no AWS call bypasses the plugin.** Across all 490 files there is **not one**
+`withAWS`, `s3Upload`, `ecrLogin`, `cfnUpdate`, `invokeLambda` or any other JVM-side AWS
+step. Every AWS call goes through a shell, which is exactly what `AWS_CONFIG_FILE`
+covers. Had even one existed, the plugin would neither audit nor affect it — a silent
+hole. This is the strongest evidence yet that the mechanism is complete.
+
+**Result 2 — every context block in use has a canary.**
+
+| block | files | | block | files |
+|---|---|---|---|---|
+| stage | 295 | | withCredentials | 84 |
+| script | 287 | | catchError | 59 |
+| cleanWs | 253 | | withEnv | 37 |
+| dir | 245 | | deleteDir | 15 |
+| **withSonarQubeEnv** | **142** | | ansiColor / timeout / parallel / timestamps | 9 / 2 / 2 / 2 |
+
+`withSonarQubeEnv` at 142 files confirms how consequential that catch was — it was in no
+canary until the corrected census found it.
+
+The names the scan flagged as "uncovered" — `Utilities`, `Build`, `Deploy`, `call`,
+`extractVariable`, `stormusDeployment`, `kongDeployment` … — are **shared-library global
+vars**, i.e. Groovy functions, not context-publishing block steps. Their bodies live in
+`vars/*.groovy`, which are themselves among the 490 files scanned, so the blocks they use
+internally are already counted.
+
+**Conclusion: coverage is now static and complete, not sampled.** Enumeration no longer
+depends on a job having run, and the additions-only invariant covers whatever is written
+next.
+
+### Session 24 addendum 7 — the Terraform second hop: measured, and unfixable plugin-side
+
+Hypothesis: exporting `AWS_ROLE_SESSION_NAME` would make Terraform's provider-level
+`assume_role` name its session after the build, closing the gap with no repo change.
+
+**Tested, and false.** A build with the variable set ran `terraform plan` against a
+provider carrying its own `assume_role`. CloudTrail (ops account, found via
+`AttributeKey=Username,AttributeValue=jk-...`):
+
+```
+CALLER:    .../ck-ops-jenkins-master-instance-iam-role/jk-poc-canary-terraform-secondhop-2
+requested: roleSessionName = aws-go-sdk-1786899555220461151
+RESULT:    .../terraform-assume-role/aws-go-sdk-1786899555220461151
+```
+
+The provider constructs the second AssumeRole from the `assume_role` block alone and
+generates `aws-go-sdk-<nanotime>` when `session_name` is absent. No environment variable
+reaches it. **No plugin-side fix exists**; the only direct fix is `session_name` in the
+provider block, which is a repository change and therefore excluded.
+
+**What holds instead:** CloudTrail records the *caller* of that AssumeRole as the `jk-`
+session, so every subsequent Terraform call is one join from the build. Affects **3 of
+802 jobs** (`cln-app-terraform-pipeline`, `ck-analytics-app-services-terraform`,
+`ck-ecs-terraform`). The other 18 Terraform jobs have no provider `assume_role` and are
+directly attributed.
+
+The export is retained — additive, free, may help a tool that does read it — but must
+not be described as covering Terraform.
+
+**Method note worth keeping:** cross-account AssumeRole is logged in the *calling*
+account too, and `lookup-events` cannot find it by role name. The query that works is
+`AttributeKey=Username,AttributeValue=<the jk- session>`, because CloudTrail indexes the
+caller's session name as Username.
+
+### Session 24 addendum 8 — dev2/fluentd: end-to-end proof on a real deployment
+
+`dev2/fluentd #119` ran from poc-2 with 2.2 enforcing and **SUCCEEDED** in 3 minutes:
+Bitbucket checkout → shared library → SSM → Docker build → ECR push → ECS deploy →
+`ecs wait services-stable`. This closed the last untested execution path, the
+**SCM-backed pipeline** (639 jobs).
+
+**35 CloudTrail events across two accounts, every one labelled `jk-dev2-fluentd-119`** —
+including the mutating `ecs:RegisterTaskDefinition`, `ecs:UpdateService` and ECR
+`PutImage`. Critically it exercised **both** attribution paths in one build: profile-based
+calls through the decorated profile, and **profile-less ECR calls** through the
+`[default]` self-assume — the ~98% case that was previously unattributable.
+
+Chosen over `dev2/profitability` because it takes **no parameters**. `profitability` has a
+`branch` param defaulting to **`uat`**; running it with defaults would have deployed uat
+code into dev2, and only one build is retained on either controller so there was no
+history to learn the right branch from. **Check parameter defaults before running a job,
+not just its stages.**
+
+### Session 24 addendum 9 — configuration-surface review and the reporting gap
+
+Two questions asked before the infra install, both answered without a code change.
+
+**1. What observe-only actually does.** It is not a partial dry run — it runs the
+*whole* path and withholds exactly one step. The node's config is read, decorated,
+validated, and **the file is genuinely written** to `<workspace>@tmp/ck-aws/config`.
+Only the export is skipped, so `AWS_CONFIG_FILE` and `CK_AWS_SESSION_NAME` stay unset,
+nothing reads the file, and no build behaviour changes. Both halves were confirmed on
+the canary: file present on disk, variables unset inside the build.
+
+**The record exists only in the build's console log.** No aggregation, no central
+report, nothing outside each individual build. This is the honest limitation — it
+answers "what would this build do", one build at a time, and cannot answer "is
+anything slipping through".
+
+**2. The UI has ten fields and they are not equally useful.** Reviewed field by field:
+
+*Load-bearing:* managed authentication (master switch / rollback), except-jobs-matching
+(the per-job incident switch), attribute-as-node's-own-role (the ~98%), observe-only
+(the rollout mechanism), diagnostics (the source of every piece of POC evidence).
+
+*Dead weight:* node-label pattern (no demonstrated use case — the fail-safe paths made
+it unnecessary), the AWS profiles list (**`sections appended: []` in every single
+diagnostic block ever printed** — it has never added a profile), agent base identity
+(only affects `[default]`, always `Ec2InstanceMetadata` on EC2).
+
+*A genuine footgun:* **the static `unprofiledRoleArn` free-text field.** During testing
+it was deliberately pointed at `arn:aws:iam::999999999999:role/this-role-does-not-exist`
+as a poison pill — which is precisely what a typo would do in production, breaking every
+bare `aws` call in every build. It is fully superseded by the per-node checkbox, which
+resolves each node's real role *and probes that the assume succeeds* before using it.
+Shipping both, where the older is strictly worse, is a design defect. **Decision: leave
+blank and documented as deprecated for the infra install; delete it in the next version
+that touches that file** — removing it now would cost another build, hash and reinstall
+for no safety gain, since blank is already correct.
+
+**3. Automatic notification when a job isn't audited.** Neither the plugin nor
+observe-only reports centrally. The answer is two mechanisms, because they catch
+different things:
+
+- **Jenkins side:** a log recorder on `io.github.rads4.ckaws` at WARNING (*Manage
+  Jenkins → System Log*). Zero code, zero build impact, collects every decline with its
+  reason. **Blind to anything the plugin thinks succeeded** — it will never surface the
+  Terraform second hop.
+- **AWS side, and this is the real one:** CloudTrail bucketed by session-name shape.
+  `jk-<job>-<build>` = audited; `i-0…` = uncovered unprofiled call; `aws-go-sdk-…` /
+  `botocore-session-…` / 32-hex = a tool that assumed a role itself. It is
+  **outcome-based** — it measures what reached AWS rather than what the plugin intended
+  — so it catches gaps in jobs nobody has written yet. Deliverable as a Logs Insights
+  query, a metric filter + alarm, or an EventBridge rule; all AWS-side only and
+  structurally incapable of affecting a build.
+
+Blind spot in both: a job authenticating some entirely other way (static keys in a
+Jenkins credential). The census found none; neither mechanism would see one appear.
+
+**Deferred by decision:** the reporting implementation itself. Rads will consider it
+after the infra install rather than before.
+
+### Session 24 addendum 10 — `.hpi` builds are not byte-reproducible
+
+Re-running `mvn clean verify` on **unchanged source** (only `.md` files were edited)
+produced `sha256 c0507c9a8d195f60e3ad0c8bea0725ad48567982e519ca8aa8ccd39d1ad3344e`, not
+the recorded `f5150ba3…`. Jar entries carry build timestamps, so **every rebuild yields a
+new hash even when nothing in `src/` changed.**
+
+Consequence for the "one hash is the installable artifact" convention: it identifies a
+*build*, not a *source state*. Two implications, both mattering right now:
+
+1. `mvn clean` **deleted the f5150ba3 artifact** — the only surviving copy is the one
+   installed on `poc-jenkins-2` at `/var/lib/jenkins/plugins/ck-aws.hpi`. That is the
+   binary every canary, every agent test and `dev2/fluentd #119` actually validated.
+2. For the infra install, choose deliberately: either **retrieve f5150ba3 from poc-2**
+   (the exact validated binary — preferred, since "tested" should mean that binary), or
+   ship a fresh build and accept that its hash was never the one under test, even though
+   the source is identical and 220 tests pass.
+
+**Never run `mvn clean` again while a validated artifact is the only copy.** Fresh builds
+are now archived outside the repo at
+`poc-jenkins-setup/artifacts/ck-aws-<version>-<short-sha>.hpi` (never committed — the
+repo is public).

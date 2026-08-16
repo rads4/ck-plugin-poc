@@ -80,6 +80,8 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
     @CheckForNull
     private String unprofiledRoleArn;
 
+    private boolean attributeUnprofiledAsNodeRole;
+
     private boolean diagnostics;
 
     private boolean observeOnly;
@@ -199,6 +201,40 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
     }
 
     /**
+     * Resolve the unprofiled identity from each node itself rather than from a fixed ARN.
+     *
+     * <p>{@link #getUnprofiledRoleArn()} is a single value for the whole controller. That is correct
+     * only while every agent shares one instance role — true for CloudKeeper today, where all 25 EC2
+     * templates use {@code ck-ops-jenkins-master-instance-role}. An agent added later with a
+     * <em>different</em> role would be handed a {@code role_arn} it is not allowed to assume, and its
+     * unprofiled {@code aws} calls would <b>fail</b> rather than merely go unattributed. That is the
+     * one way this feature could break a build, and it would appear only on a node nobody tested.
+     *
+     * <p>With this set, the plugin asks each node for its own instance role over IMDS at preparation
+     * time and uses that. Every node is then correct by construction, including nodes that do not
+     * exist yet, and there is no value to keep in step with infrastructure changes.
+     *
+     * <p>Fail-safe: if the node has no instance profile, or IMDS cannot be read, the plugin adds no
+     * {@code [default]} at all and unprofiled calls are left exactly as the node left them — the
+     * behaviour before this feature existed.
+     *
+     * <p><b>What this still cannot check</b> is whether the node's role is <em>permitted</em> to assume
+     * itself. Self-assume needs the role's own identity policy to allow {@code sts:AssumeRole} on its
+     * own ARN; if it does not, unprofiled calls on that node will fail. Verify with
+     * {@code aws iam simulate-principal-policy --policy-source-arn ROLE --action-names sts:AssumeRole
+     * --resource-arns ROLE} before enabling this on a controller with mixed agent roles.
+     */
+    public boolean isAttributeUnprofiledAsNodeRole() {
+        return attributeUnprofiledAsNodeRole;
+    }
+
+    @DataBoundSetter
+    public void setAttributeUnprofiledAsNodeRole(boolean attributeUnprofiledAsNodeRole) {
+        this.attributeUnprofiledAsNodeRole = attributeUnprofiledAsNodeRole;
+        save();
+    }
+
+    /**
      * Prints what the plugin discovered to the build console.
      *
      * <p>Deliberately configuration rather than a system property: a system property needs a controller
@@ -268,6 +304,7 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         jobNameExcludePattern = null;
         nodeLabelPattern = null;
         unprofiledRoleArn = null;
+        attributeUnprofiledAsNodeRole = false;
         diagnostics = false;
         observeOnly = false;
         credentialSource = DEFAULT_CREDENTIAL_SOURCE;

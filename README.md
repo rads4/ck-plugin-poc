@@ -10,7 +10,7 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 2.2 — implemented, 210 tests. 2.1 is what is installed on CK production.**
+**Status: 2.2 — implemented, 220 tests. 2.1 is what is installed on CK production.**
 
 > **Versions track installations, not builds.** A number must change before an
 > artifact is *installed* on a controller, so that "the controller says 2.2"
@@ -20,10 +20,10 @@ always does.
 > work and their hashes were circulated, but **none was ever installed**, so the
 > shipping build re-takes **2.2**.
 >
-> **Only `sha256 b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45`
-> may be installed.** Any earlier artifact calling itself 2.2, 2.3 or 2.4 is void —
-> the first of them still contained the context-shadowing defect. See
-> [MEMORY.md](MEMORY.md), Session 23, for the superseded hashes.
+> **Only `sha256 f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523`
+> may be installed.** Every earlier artifact calling itself 2.2, 2.3 or 2.4 is void,
+> including `b4c94c78…` (no environment invariant), `edde1e04…` (misleading observe-only
+> diagnostics) and `4cc0aada…` (no per-node unprofiled resolution). See [MEMORY.md](MEMORY.md) for the superseded hashes.
 
 Two unmodified production pipelines ran with Managed Authentication on and were
 fully attributed in CloudTrail — a prod ECS deployment (25 events) and a non-prod
@@ -68,6 +68,42 @@ invocation in production had the affected shape**, across 371 distinct jobs.
   memo is reused.
 - **Parallel race.** Concurrent `parallel` branches could prepare the same key at
   once. Preparation is now under a per-key lock.
+- **Runtime additions-only invariant on the environment.** Before contributing, the
+  plugin expands the enclosing environment and the merged one it proposes, and
+  compares them. If any variable an enclosing block set would be dropped or
+  changed, it contributes nothing and the build keeps its own environment. The
+  config file has had this check since M12; the environment had none, and that
+  asymmetry is why rivon shipped — the guard caught exceptions, and nothing threw.
+  This is the only layer that covers **shapes nobody has written yet**, so it is
+  what makes future jobs safe without enumerating them.
+- **Unprofiled attribution resolved per node.** *Attribute unprofiled calls as the
+  node's OWN instance role* asks each node for its instance role over IMDS when a build
+  prepares, instead of using one ARN for the whole controller. A single ARN is only
+  correct while every agent shares one role; hand a node a `role_arn` it may not assume
+  and its unprofiled `aws` calls **fail** rather than merely going unattributed — the one
+  way this feature can break a build, and it would surface first on a node nobody tested.
+  Per-node resolution removes that failure mode for agents that do not exist yet. Nodes
+  that report no instance role get no `[default]` at all, so they are left exactly as
+  they are today. This matters because **~98% of production AWS calls name no profile**.
+
+- **`AWS_ROLE_SESSION_NAME` is exported too.** The generated config names the session for
+  every role the *shared config* assumes — the AWS CLI, boto3, Terraform's default
+  resolution. It does not cover a **second hop** performed by the tool itself: a Terraform
+  provider with its own `assume_role` block assumes a further role and, with no
+  `session_name` there, picks the name itself. Every AWS SDK reads
+  `AWS_ROLE_SESSION_NAME`, so exporting it names that hop **without editing a single
+  `.tf` file, Jenkinsfile or shared library** — which matters, because the plugin's whole
+  premise is attribution with no repository changes. *Status: measured — the Terraform AWS provider **ignores it** and generates
+  `aws-go-sdk-<nanotime>`. There is no plugin-side fix for that hop; CloudTrail still
+  records the caller as `jk-<job>-<build>`, so those calls are traceable with one join
+  rather than directly labelled. Affects 3 of 802 jobs.*
+
+  Naming the right role is not enough — AWS must also *permit* the role to assume
+  itself. If it does not, writing `role_arn` would turn "not audited" into a build that
+  **fails**, on a node nobody tested. So the plugin proves it first: one
+  `sts:AssumeRole` probe per node, cached. A refusal means no `[default]` is written and
+  that node's unprofiled calls are left working and unattributed. There is no
+  configuration in which enabling this can break a build.
 - **Observe-only mode.** Prepare, decorate, validate, write and report — and
   export *nothing*. Rivon proved that a guard which only catches exceptions cannot
   catch a contribution that succeeds and still removes something. Observe-only is
@@ -141,14 +177,16 @@ pipeline code, and never in `~/.aws/config`.
 ```yaml
 unclassified:
   ckAws:
-    managedAuthentication: true      # off by default
-    jobNamePattern: "uat/.*"         # optional; blank means EVERY job
-    jobNameExcludePattern: ""        # optional; wins over the include pattern
-    nodeLabelPattern: ""             # optional; blank means every node
-    unprofiledRoleArn: ""            # optional; the agent's OWN instance role
+    managedAuthentication: true            # off by default
+    jobNamePattern: "uat/.*"               # optional; blank means EVERY job
+    jobNameExcludePattern: ""              # optional; wins over the include pattern
+    nodeLabelPattern: ""                   # optional; blank means every node
+    attributeUnprofiledAsNodeRole: true    # resolve each node's OWN role over IMDS
+    unprofiledRoleArn: ""                  # deprecated — leave blank, see below
+    observeOnly: false
     diagnostics: false
     credentialSource: "Ec2InstanceMetadata"
-    profiles:                        # optional overrides only — see below
+    profiles:                              # optional overrides only — see below
       - name: "dr"
         mode: "AssumeRole"
         roleArn: "arn:aws:iam::123456789012:role/dr"
@@ -161,9 +199,24 @@ unclassified:
 | `jobNamePattern` | blank = **all jobs** | Phased rollout. Full-string match against a job's *full* name. An unparseable pattern matches nothing, so a typo narrows rather than widens |
 | `jobNameExcludePattern` | blank = exclude nothing | Evaluated after include and wins. The incident switch. An unparseable pattern excludes nothing |
 | `nodeLabelPattern` | blank = every node | Matched in full against each of the node's labels and its node name; the built-in node matches `built-in` |
-| `unprofiledRoleArn` | blank = leave them alone | Attributes calls naming no profile. **Use the agent's own instance role** |
+| `attributeUnprofiledAsNodeRole` | `false` | Resolves each node's own instance role over IMDS and verifies it can assume itself. **This is what attributes the ~98% of calls that name no profile.** Overrides `unprofiledRoleArn` entirely |
+| `unprofiledRoleArn` | blank = leave them alone | **Deprecated — leave blank.** A single static ARN is only ever correct while every agent shares one role, and a wrong value breaks every unprofiled call. Superseded by the setting above |
+| `observeOnly` | `false` | Prepares and logs everything, exports nothing. See below |
 | `diagnostics` | `false` | Prints what was found and changed. Non-sensitive; no restart |
-| `credentialSource` | `Ec2InstanceMetadata` | How agents obtain their base identity. Also `EcsContainer`, `Environment` |
+| `credentialSource` | `Ec2InstanceMetadata` | How agents obtain their base identity, for profiles the plugin *writes*. Also `EcsContainer`, `Environment` |
+
+### What observe-only actually does
+
+It runs the **whole** contribution path and withholds only the final step. The
+node's config is read, decorated, validated, and **written** to
+`<workspace>@tmp/ck-aws/config`; the console records what would have happened. What
+does *not* happen is the export — `AWS_CONFIG_FILE` and `CK_AWS_SESSION_NAME` are
+never set, so nothing reads the file and no build behaviour changes.
+
+The record exists **only in each build's console log**. There is no aggregation and
+no central report, so observe-only tells you what the plugin *would* do, one build
+at a time. Measuring what actually reached AWS is a CloudTrail question, not a
+plugin one.
 
 **You do not enumerate profiles here.** The agent's own `~/.aws/config` is the
 source of truth: it is copied and decorated, so a profile added to an agent

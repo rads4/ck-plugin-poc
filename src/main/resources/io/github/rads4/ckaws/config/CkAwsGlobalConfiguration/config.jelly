@@ -37,6 +37,13 @@
     </f:entry>
 
     <f:entry
+        title="Attribute unprofiled calls as the node's OWN instance role"
+        field="attributeUnprofiledAsNodeRole"
+        description="Recommended instead of typing an ARN above. Each node is asked for its own instance role over IMDS when a build prepares, so every agent is correct by construction — including agents that do not exist yet. A single typed ARN is only right while every agent shares one instance role; hand a node a role it may not assume and its unprofiled aws calls FAIL rather than merely going unattributed. When this is ticked the ARN above is ignored. If a node reports no instance role, nothing is written and its unprofiled calls are left exactly as they are today. Note this cannot check whether the node's role is PERMITTED to assume itself — verify with: aws iam simulate-principal-policy --policy-source-arn ROLE --action-names sts:AssumeRole --resource-arns ROLE">
+      <f:checkbox/>
+    </f:entry>
+
+    <f:entry
         title="AWS profiles"
         description="Optional. The agent's own AWS configuration is the source of truth and is used as-is; entries here are only added for profiles the agent does not define. Leave the role ARN blank for a profile that should use the agent's own identity.">
       <f:repeatableProperty field="profiles" add="Add profile" minimum="0"/>

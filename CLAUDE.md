@@ -39,7 +39,7 @@ project.**
 | ~~M12i — production incident investigation (Gradle 403)~~ | **Closed: the plugin was not the cause.** See below |
 | v2.0 — unprofiled attribution, output verification, runtime controls | Superseded by 2.1 before wide rollout |
 | v2.1 — Freestyle coverage, trailing-blank fix, no-role profiles | Implemented, 201 tests — **this is what is installed on CK production** |
-| **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only** | **Implemented, 210 tests, `ck-aws 2.2`. Built, not yet installed** |
+| **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only, additions-only environment invariant, per-node unprofiled attribution** | **Implemented, 220 tests, `ck-aws 2.2` (`sha256 f5150ba3…`). Installed and validated on the POC clone; NOT yet on CK production** |
 
 **Versioning: versions track INSTALLATIONS, not builds.** The number must change before an
 artifact is *installed* on a controller, so that "the controller says 2.2" answers "which 2.2"
@@ -1356,6 +1356,61 @@ document favours an option.
 
 ---
 
+# What 2.2 exports, and why each one
+
+| variable | purpose | covers |
+|---|---|---|
+| `AWS_CONFIG_FILE` | points every AWS tool at the decorated copy of the node's own config | AWS CLI, boto3, Terraform's default credential resolution — **every** AWS call that goes through a shell |
+| `CK_AWS_SESSION_NAME` | the build's session name, for a script that wants to log or tag with it | informational |
+| `AWS_ROLE_SESSION_NAME` | names a session when a **tool assumes a role itself** | the Terraform "second hop" — see below |
+
+## The second-hop problem
+
+The generated config names the session for every role the *shared config* assumes. It
+cannot name a hop the tool performs on its own: a Terraform provider carrying its own
+`assume_role` block assumes a further role from the already-assumed session, and with no
+`session_name` in that block the provider picks the name. The calls that actually change
+infrastructure then carry a generated name, and CloudTrail ties them back only through
+the AssumeRole event.
+
+Measured: **3 of 21 Terraform jobs** have a provider-level `assume_role` and none sets
+`session_name` — `cln-infra-terraform-pipelines/cln-app-terraform-pipeline`,
+`ck-analytics-app-services-terraform`, `ck-ecs-terraform`. The other 18 use the profile
+from `AWS_CONFIG_FILE` and are fully attributed already.
+
+**The fix must be plugin-side, not repo-side.** The premise of this plugin is attribution
+with no change to any Jenkinsfile, `.tf` file or shared library — a fix that requires
+editing repositories is not a fix. Every AWS SDK reads `AWS_ROLE_SESSION_NAME`, so
+exporting it names the second hop without touching anything.
+
+**Status: MEASURED, and it does NOT work.** `AWS_ROLE_SESSION_NAME` was exported into a
+build that ran `terraform plan` against a provider with its own `assume_role` block. The
+provider ignored it:
+
+```
+CALLER:    .../ck-ops-jenkins-master-instance-iam-role/jk-poc-canary-terraform-secondhop-2
+requested: roleSessionName = aws-go-sdk-1786899555220461151
+RESULT:    .../terraform-assume-role/aws-go-sdk-1786899555220461151
+```
+
+The Terraform AWS provider builds the second AssumeRole from the `assume_role` block
+alone and generates `aws-go-sdk-<nanotime>` when `session_name` is absent. No environment
+variable reaches it.
+
+**There is therefore no plugin-side fix for the Terraform second hop.** The only direct
+fix is `session_name` in the provider block — a repository change, which the project's
+premise excludes.
+
+**What is true instead: attribution is transitive, and complete.** CloudTrail records the
+*caller* of that AssumeRole as `jk-<job>-<build>`. So every Terraform API call can be
+tied back with one join: `aws-go-sdk-<n>` → the AssumeRole event that created it →
+`jk-<job>-<build>`. Direct labelling is missing for 3 of 802 jobs; traceability is not.
+
+The export is retained because it is additive and free, and it may name a second hop for
+any tool that *does* read it — but it must not be described as covering Terraform.
+
+---
+
 # Residual risk register (as of 2.2)
 
 Everything below was established by reproduction or by census, not by argument.
@@ -1366,18 +1421,43 @@ Re-verify before widening scope.
 The master switch is what you reach for *after* something breaks, and it needs a
 human watching a queue. The real net has three layers:
 
-1. **Structural.** The plugin can now only *add*. Both surfaces it touches have an
-   additions-only invariant: the config file is checked at runtime by
-   `AwsConfigOverlay.validate()`, and the environment is guaranteed by merge
-   ordering and locked by tests. This is what closes the class of defect that
-   broke `dev2/rivon` — a contribution that succeeded and still took something
-   away, which the exception guard could never have caught.
+1. **Structural.** The plugin can now only *add*, and **both** surfaces it touches
+   are checked at runtime, not argued from construction:
+   - config file — `AwsConfigOverlay.validate()`
+   - environment — `ManagedAwsContext.wouldRemoveSomething()`, which expands the
+     enclosing environment and the proposed merged one and compares them. If any
+     variable the enclosing block set would be dropped or altered, the plugin
+     contributes nothing and the build keeps its own environment.
+
+   This closes the defect class that broke `dev2/rivon`: a contribution that
+   succeeded and still took something away, which the exception guard could never
+   have caught because nothing threw.
+
+   The environment check earlier relied on merge ordering being correct by
+   construction. That was replaced because "correct by construction" is exactly the
+   claim that failed for rivon, and because the ordering argument depends on
+   `DelegatedContext.get` returning the enclosing expander faithfully. Should it
+   ever return null, a partial view, or a different level — in a nesting shape
+   nobody has written yet — the merge is built from the wrong base and the argument
+   silently stops holding. Comparing actual expansions needs no such assumption, so
+   **an unimagined shape fails safe instead of failing silently.** That is what
+   makes future jobs safe without enumerating them.
 2. **Per-job, instant.** *Except jobs matching* is a kill switch for one job that
    needs no restart and no global toggle. Reach for it before the master switch.
 3. **Observe only.** Prepare everything, export nothing. Widen the scope to every
    job, let real traffic run for a day, read the evidence, then enforce. This is
    how you survey 740 jobs — including the 637 whose Jenkinsfiles live in SCM —
    without any possibility of affecting one of them, and without watching a queue.
+
+   **Precisely what it does:** the whole path runs — the node's config is read,
+   decorated, validated, and the file *is* **written** to `<workspace>@tmp/ck-aws/
+   config`. Only the export is withheld, so `AWS_CONFIG_FILE` and
+   `CK_AWS_SESSION_NAME` stay unset, nothing reads the file, and behaviour is
+   unchanged. Verified both halves on a canary: file present, variables unset.
+
+   **The record lives only in each build's console log** — there is no aggregation
+   and no central report. Observe-only answers "what would this build do", one
+   build at a time. "Is anything slipping through" is a CloudTrail question.
 
 Reach for them in that order. The master switch is the fourth thing, not the
 first.
@@ -1400,16 +1480,78 @@ by the Freestyle path for free.
 
 ## Will not be audited today — by design, not by defect
 
-- **Calls naming no profile** — `aws ecr get-login-password`, and any bare `aws`
-  command — resolve straight to IMDS, whose session name EC2 fixes to the
-  instance ID. They stay unattributed until *Attribute unprofiled calls as* is
-  set. Safe to set from 2.2 onward; the duplicate-key guard that makes it safe
-  ships with it.
+- **Calls naming no profile on a node that cannot self-assume.** Bare `aws`
+  commands resolve straight to IMDS, whose session name EC2 fixes to the instance
+  ID. *Attribute unprofiled calls as the node's own instance role* closes this for
+  every node whose role can assume itself — proven on all 7 slave types and the
+  controller. A node where the probe fails is left exactly as it was and logs a
+  warning; it stays unattributed rather than breaking.
 - **Terraform's own `assume_role` block** (55 of 432 workspaces). `session_name`
   appears in no `.tf` file, so the second hop gets an SDK-generated name. Still
   traceable transitively — CloudTrail records the `jk-*` session that called
   `AssumeRole`. Closing it is a Terraform-repo change: set `session_name` from the
   `CK_AWS_SESSION_NAME` this plugin already exports.
+
+## Configuration surface — what is load-bearing and what is not
+
+Ten fields ship. They are not equally valuable, and one is a hazard.
+
+**Load-bearing — do not remove:**
+
+| Field | Why |
+|---|---|
+| *Managed authentication* | Master switch, and the restart-free rollback |
+| *Except jobs matching* | The incident switch: one job excluded without a global toggle |
+| *Attribute unprofiled calls as the node's own instance role* | Audits ~98% of calls. Without it coverage is ~2% |
+| *Observe only* | The rollout mechanism; full scope at zero risk |
+| *Diagnostics* | Every piece of POC evidence came from it |
+
+**Dead weight — kept only because removing them is a code change:**
+
+- ***Attribute unprofiled calls as* (the static role ARN) is a footgun.** It was
+  used as a deliberate poison pill during testing — pointing it at a nonexistent
+  ARN breaks every bare `aws` call in every build, which is exactly what a typo
+  would do. It is fully superseded by the per-node checkbox, which resolves each
+  node's real role and *verifies the assume succeeds* before using it. Two fields
+  for one concept, where the older one is strictly worse. **Leave blank; remove it
+  in the next version that touches this file.**
+- ***Apply on nodes labelled*** — no demonstrated use case. Its original
+  justification (agents that differ, or make no AWS calls) is now handled
+  structurally: a node with no config gets nothing contributed, and a node that
+  cannot self-assume is detected and skipped. Never used in any test.
+- ***AWS profiles*** (the repeatable list) — **never once used.** Every diagnostic
+  block in the entire POC printed `sections appended: []`. The agent's own
+  `~/.aws/config` has always been the source of truth. Harmless, not load-bearing.
+- ***Agent base identity*** — only affects profiles the plugin writes, which in
+  practice is just `[default]`, and on EC2 it is always `Ec2InstanceMetadata`. It
+  would matter if agents moved to ECS or EKS.
+
+*Apply to jobs matching* sits in between: largely redundant now that observe-only
+surveys everything at zero risk, but it costs nothing and was used constantly.
+
+## Detecting unaudited calls automatically
+
+Neither the plugin nor observe-only reports centrally. Two mechanisms cover it,
+and they catch different things — use both.
+
+1. **Jenkins side — a log recorder.** No code, no build impact. *Manage Jenkins →
+   System Log → Add recorder* on `io.github.rads4.ckaws` at WARNING collects every
+   decline in one place: nodes with no resolvable role, contributions refused by
+   the additions-only invariant, and anything the guard swallowed. **It only sees
+   what the plugin knows** — it will never show the Terraform second hop, because
+   there the plugin succeeded.
+2. **AWS side — CloudTrail, and this is the real detector.** It is outcome-based:
+   it measures what actually reached AWS. Bucket calls made by the Jenkins instance
+   role by session-name shape — `jk-<job>-<build>` is audited; `i-0…` is an
+   uncovered unprofiled call; `aws-go-sdk-…` / `botocore-session-…` / 32-hex is a
+   tool that assumed a role itself. Anything not `jk-` is a gap, automatically and
+   permanently, **including in jobs nobody has written yet.** Implement as a Logs
+   Insights query, a metric filter with an alarm, or an EventBridge rule — all
+   AWS-side only, structurally incapable of affecting a build.
+
+Known blind spot in both: a job authenticating some entirely other way, e.g. static
+keys in a Jenkins credential. The census found none, but neither mechanism would
+see one appear.
 
 ## Session names: settled, do not re-litigate
 
