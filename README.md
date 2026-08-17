@@ -116,7 +116,8 @@ invocation in production had the affected shape**, across 371 distinct jobs.
   `AWS_ROLE_SESSION_NAME`, so exporting it names that hop **without editing a single
   `.tf` file, Jenkinsfile or shared library** — which matters, because the plugin's whole
   premise is attribution with no repository changes. *Status: measured — the Terraform AWS provider **ignores it** and generates
-  `aws-go-sdk-<nanotime>`. There is no plugin-side fix for that hop; CloudTrail still
+  `aws-go-sdk-<nanotime>`. **Superseded 2026-08-17:** a Terraform `*_override.tf` written at
+  build time does fix it, proven end to end — see MEMORY.md addendum 6. Until that ships, CloudTrail still
   records the caller as `jk-<job>-<build>`, so those calls are traceable with one join
   rather than directly labelled. Affects 3 of 802 jobs.*
 

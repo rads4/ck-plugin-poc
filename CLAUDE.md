@@ -135,7 +135,8 @@ observe-only → read a day of console evidence → untick observe-only.
 
 - **3 of 802 jobs** (`cln-app-terraform-pipeline`, `ck-analytics-app-services-terraform`,
   `ck-ecs-terraform`) have provider-level `assume_role`; their post-hop calls carry
-  `aws-go-sdk-<nanotime>` and are traceable only transitively. No plugin-side fix exists.
+  `aws-go-sdk-<nanotime>` and are traceable only transitively today. **A fix is proven** — a
+  Terraform `*_override.tf` written at build time, no repo change; see MEMORY.md addendum 6.
 - A node whose role AWS will not let self-assume stays **unattributed but working**.
 - **Two job types were never run under 2.2**: a Freestyle job that really calls AWS, and
   an inline Pipeline that really calls AWS. Both code paths are test-locked and the
@@ -1484,7 +1485,11 @@ The Terraform AWS provider builds the second AssumeRole from the `assume_role` b
 alone and generates `aws-go-sdk-<nanotime>` when `session_name` is absent. No environment
 variable reaches it.
 
-**There is therefore no plugin-side fix for the Terraform second hop.** The only direct
+**Superseded 2026-08-17.** A Terraform `*_override.tf` created in the working directory at build
+time sets `session_name` on the provider's own `assume_role`, proven against the real cross-account
+role with the real repo shape (MEMORY.md addendum 6). The override MUST copy `role_arn` verbatim —
+omitting it silently drops the assume and Terraform runs as the raw instance role. The text below
+records the original measurement, which remains accurate about environment variables. The only direct
 fix is `session_name` in the provider block — a repository change, which the project's
 premise excludes.
 

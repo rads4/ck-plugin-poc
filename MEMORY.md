@@ -46,7 +46,7 @@
 
 ### Not proven / known open
 
-- **Terraform second hop — measured and closed as unfixable from the plugin.** The
+- **Terraform second hop — SOLVED 2026-08-17 (addendum 6), was previously recorded as unfixable.** The
   provider ignores `AWS_ROLE_SESSION_NAME` and generates `aws-go-sdk-<nanotime>`.
   Affects **3 of 802 jobs**; their post-hop calls are traceable only transitively, via
   the `jk-` session CloudTrail records as the *caller* of that AssumeRole
