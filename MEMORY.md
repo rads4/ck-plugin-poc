@@ -3309,3 +3309,43 @@ console works.
 
 **236 tests.** Untested still: the delete-last-profile path in `configure()` (verified correct by
 reading core bytecode, but no test), and the runner's stdin/cap/timeout paths.
+
+### Session 25 addendum 5 — boto3 closed with evidence; Terraform needs no further testing
+
+**boto3 was the last untested execution mechanism**, and it mattered: most Freestyle jobs on this
+controller call AWS through Python scripts, not the CLI, and *every* canary until now used the CLI.
+"botocore honours `AWS_CONFIG_FILE`" was reasoning, not evidence — and reasoning-instead-of-evidence
+is exactly what shipped the rivon defect.
+
+`poc-canary-boto3` (Freestyle on the controller, created for this, matches the existing
+`poc-canary-*` scope so no config change was needed):
+
+```
+BOTO3_VERSION=1.34.46
+BOTO3_DEFAULT_ARN     = …/ck-ops-jenkins-master-instance-iam-role/jk-poc-canary-boto3-1
+BOTO3_PROFILE_ops_ARN = …/ck-ops-jenkins-master-instance-iam-role/jk-poc-canary-boto3-1
+```
+
+**Both paths attributed** — the unprofiled `[default]` self-assume *and* an explicitly named profile.
+The ARN is returned *by* `sts:GetCallerIdentity`, so AWS itself confirms the session name; CloudTrail
+then indexed two `GetCallerIdentity` events under `jk-poc-canary-boto3-1`. Proven twice over.
+
+**Terraform needs no further testing.** `poc-canary-terraform-secondhop` #5 ran on 2.1.2 and
+reproduced the limitation exactly (`aws-go-sdk-1786965174359929854`). The other 18 Terraform jobs
+carry no provider `assume_role` block — they are ordinary profile-based shell and are covered by the
+CLI evidence. A real `terraform plan` would add nothing.
+
+**Coverage of execution mechanisms is now complete:** AWS CLI (unprofiled and profiled), boto3
+(unprofiled and profiled), Terraform first hop. The only gap is the Terraform/CLI **second hop**,
+10 of 802 jobs, traceable transitively and unfixable without repo changes.
+
+**Still resting on 2.2 evidence:** SCM-backed Pipeline (622 jobs, `dev2/fluentd #119`). The changes
+since then are confined to the config writer, `configure()`, the process runner and session-name
+truncation — all exercised by canaries on 2.1.2 — so this is a confidence gap, not a coverage gap.
+
+**Note on `/opt/scripts` and the clone:** those scripts live on the instance filesystem, not in git,
+so an edit made on infra master does **not** reach the clone. `UptimeReport_ecs.py` on poc-2 is dated
+10 August and still carries the original six recipients. Its mail path is blocked four ways
+regardless (SMTP host → `::1`, nothing listening on 25/465/587/2525, no local MTA, no Jenkins
+publishers), and it uses **smtplib**, not the SES API — which is why it is safe where
+`UptimeReport.py` (SES API, not blackholed) is not.
