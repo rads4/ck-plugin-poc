@@ -98,9 +98,17 @@ public final class SessionName {
     /**
      * Six lowercase hex characters of SHA-256 over the untouched job name.
      *
-     * <p>Not a security property — purely a collision breaker, so it need only be short and stable. It
-     * is computed from the ORIGINAL name rather than the sanitized one, because two names can sanitize
-     * to the same string ({@code a/b} and {@code a-b}) and would otherwise still collide.
+     * <p>Not a security property — purely a collision breaker, so it need only be short and stable. It is
+     * computed from the ORIGINAL name rather than the sanitized one, so that two names which sanitize
+     * alike still differ <em>once a digest is appended at all</em>.
+     *
+     * <p><b>Known and accepted gap.</b> A digest is appended only when the name is truncated or
+     * sanitizes to nothing. Names that sanitize lossily but still <em>fit</em> get no digest, so
+     * {@code a/b}, {@code a-b} and {@code a b} all remain {@code jk-a-b-<build>} — as do a folder job
+     * {@code platform/deploy} and a top-level {@code platform-deploy}. Closing it would mean appending a
+     * digest to every folder job, changing the session name of almost every build on the controller and
+     * breaking CloudTrail name continuity. That is a rollout decision, not a patch, and it is
+     * deliberately not taken here.
      */
     private static String shortDigest(String jobName) {
         try {

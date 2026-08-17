@@ -54,12 +54,11 @@ The number must change before an artifact is *installed* on a controller, so tha
 controller says 2.2.0" answers "which 2.2.0" unambiguously. A number that has been installed is
 **spent forever** and must never be reused. A number only ever built locally is **not** spent.
 
-**The number is provisional until installation.** A plain `mvn verify` yields
-`2.2.0-SNAPSHOT (private-<hash>-<user>)`, which is deliberately not installable; a release needs
-`mvn -Dchangelist= clean verify`. Infra Jenkins is on **2.1** and is the only controller whose
-number really matters — the two POC installs (2.2, 2.3) were test installs that spent those
-numbers. When choosing the infra number, prefer one that cannot be misread as a spent
-two-component version.
+**Numbering.** POC iterations run on the **2.1.x** line — 2.1.1, 2.1.2, … — patches on top of
+what infra already runs, one number per POC install. The **infra** install claims **2.2.0**, and
+that number is never spent on the clone, so "the controller says 2.2.0" can only mean the infra
+release. A plain `mvn verify` yields `2.1.1-SNAPSHOT (private-<hash>-<user>)`, deliberately not
+installable; a release needs `mvn -Dchangelist= clean verify`.
 
 Applying that rule, as of 2026-08-17:
 
@@ -69,13 +68,14 @@ Applying that rule, as of 2026-08-17:
 | **2.2** (`f5150ba3…`) | Test install on the POC clone. The last build validated against real jobs. Spent |
 | **2.3** (`bc4d59e1…`) | Test install on the POC clone. Spent |
 | 2.4 | Built, never installed, superseded by the code-review fixes. **Not** spent |
+| **2.1.1** | Current POC line, carrying every code-review fix |
+| 2.2.0 | **Reserved for the infra install** — never to be used on the clone |
 
 Several *earlier* artifacts also called themselves 2.2, 2.3 or 2.4 during the August 2026 defect
 work and their hashes circulated. **All of those are void** — the first still contained the
 `DynamicContext` shadowing defect. Superseded hashes are listed in MEMORY.md, Session 23.
 
-There is deliberately **no current release artifact**: development builds are
-`2.2.0-SNAPSHOT (private-…)`. Build the release at install time and record its hash then.
+Build the release at install time with `mvn -Dchangelist= clean verify` and record its hash then.
 
 This rule replaces the older "raise `<revision>` before any artifact leaves the build machine",
 which produced a version inflation of three unused numbers. The problem it was written for is

@@ -45,17 +45,21 @@
       Several earlier artifacts also called themselves 2.2/2.3/2.4 and are VOID - the
       first of them still contained the DynamicContext shadowing defect. See MEMORY.md.
 
-      The X.Y.Z line therefore starts fresh. Since infra Jenkins is on 2.1 and is the
-      controller whose number actually matters, the next INFRA install is the one that
-      claims a number. Decide it then, and prefer a value that cannot be confused with a
-      spent two-component one when read on a controller.
+      NUMBERING FROM HERE (decided 2026-08-17):
+        POC iterations run on the 2.1.x line - 2.1.1, 2.1.2, ... - because infra Jenkins
+        is on 2.1 and these are patches on top of what it already runs. Each POC install
+        spends one patch number, which is cheap.
+        The INFRA install claims 2.2.0. That number is deliberately NOT spent on the POC
+        clone, so "the controller says 2.2.0" can only ever mean the infra release.
+      Prefer a value that cannot be confused with a spent two-component version when read
+      on a controller.
 
       Build a release, not a private snapshot: `mvn -Dchangelist= clean verify` produces a
       versioned ck-aws whose version string is meaningful on a controller. A default build
       is `-SNAPSHOT (private-<hash>-<user>)`, which is deliberately NOT installable - that
       is what keeps the number provisional until installation.
     -->
-    <revision>2.2.0</revision>
+    <revision>2.1.2</revision>
     <changelist>-SNAPSHOT</changelist>
     <!--
       Baseline is pinned to CloudKeeper's actual Jenkins version (2.479.2) rather than the

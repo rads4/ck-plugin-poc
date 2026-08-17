@@ -10,8 +10,7 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 228 tests green. The release number is provisional until installation.
-2.1 is what is installed on CK production.**
+**Status: 232 tests green. 2.1 is what is installed on CK production.**
 
 > **Versioning is `major.minor.patch`** (adopted 2026-08-17):
 >
@@ -26,16 +25,22 @@ always does.
 > answers "which 2.2.0" unambiguously. A number that has been installed is spent
 > forever; a number only ever built locally is not spent and may be re-taken.
 >
-> Development builds are deliberately **not installable**: a plain
-> `mvn verify` produces `2.2.0-SNAPSHOT (private-<hash>-<user>)`. A release needs
-> `mvn -Dchangelist= clean verify`, and the number is confirmed **at install time**.
+> **Numbering.** POC iterations run on the **2.1.x** line (2.1.1, 2.1.2, …) — patches on
+> top of what infra already runs, one patch number per POC install. The **infra** install
+> claims **2.2.0**, and that number is deliberately never spent on the clone, so "the
+> controller says 2.2.0" can only mean the infra release.
+>
+> Development builds are deliberately **not installable**: a plain `mvn verify` produces
+> `2.1.1-SNAPSHOT (private-<hash>-<user>)`. A release needs `mvn -Dchangelist= clean verify`.
 >
 > | Number | Where it stands |
 > |---|---|
 > | 2.1 | On **CK production** today, master switch off. The only install that matters |
 > | 2.2 — `f5150ba3…` | Test install on the POC clone. The build validated against real jobs — every canary, all 7 agent types, `dev2/fluentd #119`. **Spent** |
 > | 2.3 — `bc4d59e1…` | Test install on the POC clone; static ARN form entry removed. **Spent** |
-> | 2.4 | Built, never installed, and now superseded by the review fixes. Not spent |
+> | 2.4 | Built, never installed, superseded by the review fixes. Not spent |
+> | **2.1.1** | Current POC line. Carries every code-review fix |
+> | 2.2.0 | **Reserved for the infra install.** Never to be used on the clone |
 >
 > Every *earlier* artifact calling itself 2.2, 2.3 or 2.4 is void — including
 > `b4c94c78…` (no environment invariant), `edde1e04…` (misleading observe-only

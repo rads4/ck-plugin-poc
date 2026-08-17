@@ -32,12 +32,25 @@ public final class CliStsAssumeRole implements StsAssumeRole {
     private static final int MAX_STDERR = 2000;
 
     /**
-     * Credential-shaped fragments in debug output: signing headers, tokens, secret keys. Case-insensitive
-     * and deliberately broad — over-masking a diagnostic is harmless, under-masking is a disclosure.
+     * Credential-shaped fragments in debug output: signing headers, tokens, secret keys.
+     *
+     * <p>The key may be <b>quoted</b> and the value may carry a Python bytes prefix, because the most
+     * likely source of such output is botocore printing request headers as a dict:
+     *
+     * <pre>headers={'X-Amz-Security-Token': b'IQoJb3JpZ2luX2VjE…', 'Authorization': b'AWS4-HMAC-SHA256 Credential=ASIA…'}</pre>
+     *
+     * <p>An earlier version required {@code name} to be followed directly by {@code [=:]}, so the
+     * apostrophe between them meant <em>nothing matched</em> and the session token was echoed verbatim —
+     * the exact disclosure this exists to prevent. The value is consumed to a structural delimiter
+     * rather than to whitespace, because {@code Authorization} values contain spaces and stopping at the
+     * first one left the access key ID exposed.
+     *
+     * <p>Deliberately broad: over-masking a diagnostic is harmless, under-masking is a disclosure.
      */
     private static final java.util.regex.Pattern SENSITIVE = java.util.regex.Pattern.compile(
-            "(?i)\\b(authorization|x-amz-security-token|aws_secret_access_key|aws_session_token|secretaccesskey|sessiontoken|signature)\\s*[=:]\\s*\\S+",
-            java.util.regex.Pattern.CASE_INSENSITIVE);
+            "(?i)[\"']?(authorization|x-amz-security-token|aws_secret_access_key|aws_session_token"
+                    + "|aws_access_key_id|secretaccesskey|sessiontoken|accesskeyid|credential|signature)"
+                    + "[\"']?\\s*[=:]\\s*b?[\"']?[^\\s,'\"}\\]]+[^,'\"}\\]]*");
 
     private static final String DEFAULT_AWS_EXECUTABLE = "aws";
 
@@ -93,7 +106,7 @@ public final class CliStsAssumeRole implements StsAssumeRole {
         if (stderr == null) {
             return "";
         }
-        String cleaned = SENSITIVE.matcher(stderr.trim()).replaceAll("$1=****");
+        String cleaned = SENSITIVE.matcher(stderr.trim()).replaceAll("$1=<redacted>");
         return cleaned.length() <= MAX_STDERR ? cleaned : cleaned.substring(0, MAX_STDERR) + "... (truncated)";
     }
 

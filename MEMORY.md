@@ -3254,3 +3254,58 @@ a throttle respectively — rather than a patch.
 **no production job uses**. They were worth fixing, but none of them gated the install. The findings
 that did matter for the 802 real jobs were the ones in `AwsConfigOverlay`, `ManagedAwsContext`,
 `ManagedAwsFreestyleEnvironment`, `CkAwsGlobalConfiguration` and `SessionName`.
+
+### Session 25 addendum 4 — third review, and validation of 2.1.1 / 2.1.2 on the clone
+
+**Versioning changed again, deliberately.** POC iterations now run on the **2.1.x** line (patches on
+what infra already runs); **2.2.0 is reserved for the infra install** and must never be spent on the
+clone, so "the controller says 2.2.0" can only ever mean the infra release.
+
+**The third review verified 5 of 8 changes correct** (against Jenkins core bytecode and the real
+`configparser`, not intuition) and found three real problems:
+
+1. **`safeStderr` missed the format it was written for.** botocore prints headers as a Python dict —
+   `'X-Amz-Security-Token': b'IQoJ…'` — and the regex required `name` followed directly by `[=:]`, so
+   the apostrophe meant **nothing matched** and the session token was echoed verbatim. Widened to
+   tolerate quoted keys and `b'` prefixes, and to consume to a structural delimiter rather than the
+   first space (which had left the access key ID visible inside `Authorization`).
+2. **The 120 s timeout could never fire.** `readCapped(stdout)` is an unbounded blocking read placed
+   *before* `waitFor`, so a child that stays alive holding stdout open never reached the timeout at
+   all — exactly the wedge the change was added for. The kill is now armed with
+   `process.onExit().orTimeout(...)` *before* the read; killing the child is what unblocks it. (The
+   reviewer separately proved `readCapped` does **not** deadlock: closing at the cap gives the child
+   SIGPIPE and `waitFor` returns in ~22 ms.)
+3. **A literal NUL byte** in `UNRESOLVABLE = "\0unresolvable"` made `ManagedAwsContext.java` read as
+   binary, so **`grep` and `rg` silently skipped the largest source file on the managed path** unless
+   given `-a`. Every grep-based search of this repo had an invisible hole. Now plain ASCII.
+
+**Also fixed: the fail-open window in `configure()`.** Seven fields were still reset *before*
+`bindJSON`, and two of those defaults fail **open** — `jobNamePattern = null` means *every job in
+scope*, `jobNameExcludePattern = null` means *the exclusion containing an incident is dropped*. An
+admin saving an unrelated setting could briefly put the whole controller in scope. Defaults are now
+applied *after* the bind, from recorded key presence, so each field moves old-value → new-value with
+no observable gap. All scope-critical fields are `volatile`, and `appliesToNode` snapshots the pattern
+into a local (SpotBugs correctly flagged that check-then-use on a volatile field is a race).
+
+**Documented rather than changed:** `SessionName` appends its digest only when the name is truncated
+or empties — `a/b`, `a-b` and `a b` still collide as `jk-a-b-<n>`, as do `platform/deploy` and
+`platform-deploy`. Closing it would re-name almost every build on the controller and break CloudTrail
+name continuity: a rollout decision, not a patch. The javadoc now states the real guarantee.
+
+**Validated on the clone, 2026-08-17:**
+
+| Build | Result |
+|---|---|
+| 12 Pipeline canaries on 2.1.2 | all SUCCESS with correct `jk-<job>-<build>` |
+| `poc-canary-freestyle-agent` #2 | CANARY_PASS on a real agent |
+| `ckaws-canary-freestyle-master` #5 | real cross-account calls: `…/ck-ops-jenkins-master-instance-iam-role/jk-…-5` **and** `…/terraform-assume-role/jk-…-5` |
+| `poc-canary-observeonly` #4 (2.1.1) | SUCCESS — `AWS_CONFIG_FILE=<unset>`, `ENCLOSING_ENV=kept` |
+| `poc-canary-terraform-secondhop` #5 | SUCCESS — second hop still `aws-go-sdk-…`, exactly as documented |
+
+**Two process lessons worth keeping.** A canary "passing" was reported from a build number that had
+not actually re-run — always check the build's **start time**, not just its result. And
+`POST /job/<name>/build` returns **400** for these Freestyle jobs; `scheduleBuild2(0)` via the script
+console works.
+
+**236 tests.** Untested still: the delete-last-profile path in `configure()` (verified correct by
+reading core bytecode, but no test), and the runner's stdin/cap/timeout paths.

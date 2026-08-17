@@ -94,22 +94,39 @@ public final class DefaultProcessRunner implements ProcessRunner {
         // Drain stderr on a helper thread while we read stdout on this thread. Daemon, so a stuck reader
         // can never keep the JVM alive; this runs in the controller JVM, where a leaked non-daemon thread
         // holding a file descriptor is a controller-wide problem rather than a build-local one.
-        String[] stderrHolder = new String[1];
-        Throwable[] stderrFailure = new Throwable[1];
+        // volatile-equivalent: joinQuietly uses a timed join, which establishes no happens-before if it
+        // expires, so a plain array element could be read stale on the success path.
+        java.util.concurrent.atomic.AtomicReference<String> stderrHolder =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> stderrFailure =
+                new java.util.concurrent.atomic.AtomicReference<>();
         Thread stderrReader = new Thread(
                 () -> {
                     try {
-                        stderrHolder[0] = readCapped(process.getErrorStream());
+                        stderrHolder.set(readCapped(process.getErrorStream()));
                     } catch (Throwable t) {
                         // Throwable, not IOException: readCapped can raise OutOfMemoryError, and letting
                         // that escape left BOTH holders null, so the caller reported a confusing NPE from
                         // the result constructor while the real failure was never surfaced.
-                        stderrFailure[0] = t;
+                        stderrFailure.set(t);
                     }
                 },
                 "ck-aws-stderr-reader");
         stderrReader.setDaemon(true);
         stderrReader.start();
+
+        // Arm the kill BEFORE reading, not after. readCapped(stdout) is an unbounded blocking read, so a
+        // child that stays alive holding stdout open without writing — `aws` retrying IMDS on a long
+        // connect timeout, a wrapper blocked on a lock — never reaches waitFor at all. Ordering the
+        // timeout after the read made it unreachable for exactly the wedge it was added for, and a
+        // blocking pipe read does not answer Thread.interrupt(), so the thread was still lost forever.
+        // Killing the process is what unblocks the read: the stream hits EOF and readCapped returns.
+        java.util.concurrent.atomic.AtomicBoolean killed = new java.util.concurrent.atomic.AtomicBoolean();
+        process.onExit().orTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS).exceptionally(t -> {
+            killed.set(true);
+            process.destroyForcibly();
+            return process;
+        });
 
         try {
             String stdout;
@@ -118,14 +135,18 @@ public final class DefaultProcessRunner implements ProcessRunner {
             } catch (Throwable t) {
                 throw new ProcessExecutionException("Failed reading stdout of process: " + command, t);
             }
-
             int exitCode;
             try {
-                // Bounded, unlike waitFor(). An unbounded wait here is how a wedged child becomes a
-                // permanently occupied thread.
+                // The read above returned, so the child has closed stdout — either by exiting or because
+                // the reaper killed it. This wait is therefore short; the bound is belt and braces.
                 if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
                     throw new ProcessExecutionException(
                             "Process did not finish within " + TIMEOUT_SECONDS + "s: " + command);
+                }
+                if (killed.get()) {
+                    throw new ProcessExecutionException(
+                            "Process exceeded " + TIMEOUT_SECONDS + "s and was terminated: " + command);
                 }
                 exitCode = process.exitValue();
             } catch (InterruptedException e) {
@@ -134,10 +155,11 @@ public final class DefaultProcessRunner implements ProcessRunner {
             }
 
             joinQuietly(stderrReader);
-            if (stderrFailure[0] != null) {
-                throw new ProcessExecutionException("Failed reading stderr of process: " + command, stderrFailure[0]);
+            if (stderrFailure.get() != null) {
+                throw new ProcessExecutionException(
+                        "Failed reading stderr of process: " + command, stderrFailure.get());
             }
-            return new ProcessResult(command, exitCode, stdout, stderrHolder[0] == null ? "" : stderrHolder[0]);
+            return new ProcessResult(command, exitCode, stdout, stderrHolder.get() == null ? "" : stderrHolder.get());
         } catch (RuntimeException | Error e) {
             // One exit path for every failure. Previously several of them threw without stopping the
             // child or the reader, leaving a thread blocked on a stream of a process nobody would reap.

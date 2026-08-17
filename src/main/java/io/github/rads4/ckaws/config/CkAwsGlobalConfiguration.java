@@ -76,28 +76,28 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      */
     private volatile List<AwsProfile> profiles = List.of();
 
-    private boolean managedAuthentication;
+    private volatile boolean managedAuthentication;
 
     @CheckForNull
-    private String jobNamePattern;
+    private volatile String jobNamePattern;
 
     @CheckForNull
-    private String jobNameExcludePattern;
+    private volatile String jobNameExcludePattern;
 
     @CheckForNull
-    private String nodeLabelPattern;
+    private volatile String nodeLabelPattern;
 
     @CheckForNull
-    private String unprofiledRoleArn;
+    private volatile String unprofiledRoleArn;
 
-    private boolean attributeUnprofiledAsNodeRole;
+    private volatile boolean attributeUnprofiledAsNodeRole;
 
-    private boolean diagnostics;
+    private volatile boolean diagnostics;
 
-    private boolean observeOnly;
+    private volatile boolean observeOnly;
 
     @NonNull
-    private String credentialSource = DEFAULT_CREDENTIAL_SOURCE;
+    private volatile String credentialSource = DEFAULT_CREDENTIAL_SOURCE;
 
     public CkAwsGlobalConfiguration() {
         load();
@@ -335,23 +335,52 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      */
     @Override
     public boolean configure(StaplerRequest2 req, JSONObject json) throws FormException {
-        // NOT emptied here. bindJSON calls setProfiles when the form carries profiles, which replaces the
-        // list atomically; when it carries none, setProfiles is never called and clearing beforehand was
-        // the only way the list could be emptied — at the cost of a window in which a concurrent build
-        // saw no profiles. Handled after the bind instead, below.
-        boolean submittedProfiles = json.has("profiles");
-        managedAuthentication = false;
-        jobNamePattern = null;
-        jobNameExcludePattern = null;
-        attributeUnprofiledAsNodeRole = false;
-        diagnostics = false;
-        observeOnly = false;
-        credentialSource = DEFAULT_CREDENTIAL_SOURCE;
+        // NOTHING is reset before the bind. An unchecked checkbox and a cleared text field are both
+        // ABSENT from the JSON, so a field the form no longer carries still has to be returned to its
+        // default — but doing that BEFORE bindJSON published the default to every concurrently running
+        // build, and two of these defaults fail OPEN:
+        //
+        //   jobNamePattern = null        -> blank pattern means EVERY job is in scope
+        //   jobNameExcludePattern = null -> the job an admin excluded during an incident is back in scope
+        //
+        // So an admin pressing Save for an unrelated setting could, for a few milliseconds, put every job
+        // on the controller into scope and drop the exclusion that was containing an incident. Recording
+        // which keys arrived and applying defaults AFTER the bind means each field moves from its old
+        // value straight to its new one, and no reader can observe the gap.
+        boolean hasProfiles = json.has("profiles");
+        boolean hasManaged = json.has("managedAuthentication");
+        boolean hasInclude = json.has("jobNamePattern");
+        boolean hasExclude = json.has("jobNameExcludePattern");
+        boolean hasNodeRole = json.has("attributeUnprofiledAsNodeRole");
+        boolean hasDiagnostics = json.has("diagnostics");
+        boolean hasObserveOnly = json.has("observeOnly");
+        boolean hasCredentialSource = json.has("credentialSource");
+
         req.bindJSON(this, json);
-        if (!submittedProfiles) {
-            // Every profile was removed from the form: one atomic write, after the bind rather than
-            // before it, so no reader ever observes an empty list that is about to be refilled.
-            this.profiles = List.of();
+
+        if (!hasProfiles) {
+            profiles = List.of();
+        }
+        if (!hasManaged) {
+            managedAuthentication = false;
+        }
+        if (!hasInclude) {
+            jobNamePattern = null;
+        }
+        if (!hasExclude) {
+            jobNameExcludePattern = null;
+        }
+        if (!hasNodeRole) {
+            attributeUnprofiledAsNodeRole = false;
+        }
+        if (!hasDiagnostics) {
+            diagnostics = false;
+        }
+        if (!hasObserveOnly) {
+            observeOnly = false;
+        }
+        if (!hasCredentialSource) {
+            credentialSource = DEFAULT_CREDENTIAL_SOURCE;
         }
         save();
         return true;
@@ -418,7 +447,11 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      *     unparseable pattern, consistent with {@link #appliesTo}.
      */
     public boolean appliesToNode(@CheckForNull Collection<String> labels) {
-        if (nodeLabelPattern == null) {
+        // Snapshot once. The field is volatile, so re-reading it could see a different value between the
+        // null check and the compile — an admin saving the configuration mid-build. One read means this
+        // decision is made against one consistent value.
+        String pattern = nodeLabelPattern;
+        if (pattern == null) {
             return true;
         }
         if (labels == null || labels.isEmpty()) {
@@ -426,7 +459,7 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
             return false;
         }
         try {
-            Pattern compiled = Pattern.compile(nodeLabelPattern);
+            Pattern compiled = Pattern.compile(pattern);
             return labels.stream().anyMatch(label -> compiled.matcher(label).matches());
         } catch (PatternSyntaxException e) {
             return false;

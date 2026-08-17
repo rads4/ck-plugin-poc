@@ -145,7 +145,7 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      * Sentinel for "this node has no usable instance role", since {@link ConcurrentHashMap} cannot hold
      * a null value. Not a valid ARN, so it can never collide with a real one.
      */
-    private static final String UNRESOLVABLE = " unresolvable";
+    private static final String UNRESOLVABLE = "(node-role-unresolvable)";
 
     @Override
     protected Class<EnvironmentExpander> type() {
@@ -351,11 +351,17 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      * {@code dir} block, and - when a step changes into a directory outside the workspace - leaves a
      * directory on the agent that no workspace cleanup will ever reclaim.
      *
-     * <p>The canonical workspace is used only when the current directory is genuinely inside it. That
-     * distinction is what keeps the other shapes correct: {@code ws('other')} allocates a workspace that
-     * is not under this job's, and a second concurrent build gets {@code …/job@2}, which is not under
-     * {@code …/job} either. Both fall back to the path they were given, which is the right answer for
-     * them.
+     * <p>The canonical workspace is used only when the current directory is genuinely inside it, which is
+     * what keeps {@code ws('other')} correct: that allocates a workspace outside this job's, so it falls
+     * back to the path it was given.
+     *
+     * <p><b>Concurrent builds are anchored too.</b> {@link Node#getWorkspaceFor} always answers
+     * {@code …/job}, but a second simultaneous build of the same job runs in {@code …/job@2}, which is
+     * not under {@code …/job}. Treating that as "outside the workspace" meant every concurrent build fell
+     * back to the current directory and re-acquired all three problems above. {@link #concurrentRoot}
+     * recognises the {@code job@N} form and anchors to it, so {@code …/job@2/app} prepares at
+     * {@code …/job@2}. Suffixes that are not concurrent-build numbers — {@code job@tmp},
+     * {@code job@script}, {@code job@2x} — are correctly rejected and still fall back.
      */
     @CheckForNull
     static FilePath buildWorkspace(@CheckForNull FilePath current, @CheckForNull Node node, Run<?, ?> run) {
