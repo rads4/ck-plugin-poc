@@ -189,13 +189,44 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         } catch (InterruptedException e) {
             throw e;
         } catch (Throwable t) {
+            // Benign races log at FINE, everything else at WARNING. This exists so that a log recorder on
+            // this package is usable as an alerting channel: if routine end-of-step noise arrives at
+            // WARNING with a stack trace, the signal an administrator actually needs — a node whose role
+            // cannot be resolved, a contribution refused by the additions-only invariant — is buried in
+            // it, and the recorder gets ignored. A monitoring channel that cries wolf is worse than none.
+            Level level = isBenignRace(t) ? Level.FINE : Level.WARNING;
             LOGGER.log(
-                    Level.WARNING,
+                    level,
                     t,
                     () -> "ck-aws: contributing nothing; this build authenticates exactly as it would "
                             + "have without the plugin");
             return null;
         }
+    }
+
+    /**
+     * Whether a failure is Jenkins' own end-of-step race rather than a problem worth an operator's time.
+     *
+     * <p>{@code DefaultStepContext.getListener()} throws {@code IOException: cannot start writing logs to
+     * a finished node} when dynamic context is recomputed for a step whose node has already completed.
+     * Nothing is wrong and nothing is lost: the step is over, so there is no process left to consume the
+     * environment. Observed repeatedly during a <em>successful</em> production deployment.
+     *
+     * <p>Matched on the message rather than the type, because the type is a bare {@link IOException} that
+     * legitimate failures also use. Deliberately narrow — anything unrecognised stays at WARNING, so an
+     * unknown failure is never silently downgraded.
+     */
+    private static boolean isBenignRace(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            String message = c.getMessage();
+            if (message != null && message.contains("cannot start writing logs to a finished node")) {
+                return true;
+            }
+            if (c.getCause() == c) {
+                break;
+            }
+        }
+        return false;
     }
 
     /**

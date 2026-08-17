@@ -3349,3 +3349,56 @@ so an edit made on infra master does **not** reach the clone. `UptimeReport_ecs.
 regardless (SMTP host → `::1`, nothing listening on 25/465/587/2525, no local MTA, no Jenkins
 publishers), and it uses **smtplib**, not the SES API — which is why it is safe where
 `UptimeReport.py` (SES API, not blackholed) is not.
+
+### Session 25 addendum 6 — the Terraform second hop IS solvable without repo changes (proven)
+
+The second hop was recorded as unfixable. **That was wrong**, and the correction came from being pushed
+to test rather than reason. Terraform has a native **override file** mechanism: any `*_override.tf` in
+the working directory is merged over the configuration. The file is created at build time, so the
+repository is never modified.
+
+**Proven on a faithful canary** replicating the real `_setting.tf` — yaml-driven locals,
+`terraform.workspace` selection, computed `role_arn` — against the real cross-account role:
+
+```
+A. baseline   275595855473:assumed-role/terraform-assume-role/aws-go-sdk-1786981874145529146
+B. override   275595855473:assumed-role/terraform-assume-role/jk-cln-app-terraform-pipeline-9001
+C. control    275595855473:assumed-role/terraform-assume-role/aws-go-sdk-1786981881777387740
+```
+
+Same role, same account, `region` preserved in all three; removing the file restores baseline exactly.
+
+**The override MUST carry `role_arn`, copied verbatim.** This is the critical design constraint, found
+by testing the obvious shortcut first:
+
+```
+override with ONLY session_name  ->  .../i-0cdd407bce366be0f
+```
+
+Terraform **replaces** the nested `assume_role` block rather than merging its attributes, so omitting
+`role_arn` silently drops the assume entirely and Terraform runs as the **raw instance role** — wrong
+principal, different permissions, no error, only a "this will be an error in a future release"
+warning. That is the single most dangerous failure mode found in this entire POC, and it is why this
+must be HCL-aware rather than a template.
+
+Provider-level attributes (`region`) *do* merge; only the nested block is replaced.
+
+**Fails loudly when mis-targeted**, which is the good direction: an override naming a provider alias
+that does not exist gives `Error: Missing base provider configuration for override`.
+
+**Real repo facts that make this tractable:** `infra-cloudkeeper-app-services` has exactly two
+`provider "aws"` blocks and **no aliases anywhere**, and both use the identical expression
+`arn:aws:iam::${local.workspace["aws"]["account_id"]}:role/${local.workspace["aws"]["role"]}`.
+
+**Design for 2.3.0** — deliberately narrow, opt-in, fail-safe by skipping:
+1. Scoped by an explicit job-name pattern; off by default.
+2. Only touches a directory whose `provider "aws"` block has an `assume_role` with **no**
+   `session_name`.
+3. Copies the `role_arn` expression **textually** — never reconstructs or hardcodes it.
+4. Skips (contributing nothing) on anything unrecognised: aliases, multiple providers, an existing
+   `session_name`, or an expression it cannot extract cleanly.
+5. Removes the file afterwards.
+
+**Scope:** this solves the **3 provider-`assume_role` jobs**. It does **not** help the 7 jobs that run
+`aws sts assume-role --role-session-name TestSessionName` in shell — proven separately that an
+explicit CLI argument cannot be overridden by env, config, or CLI alias (all three tested).
