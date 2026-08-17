@@ -3569,3 +3569,50 @@ Method note for repeating this: the box runs **Java 17**, so a driver compiled o
 with `UnsupportedClassVersionError` — use `javac --release 17`. Loading `TerraformOverride` also needs
 `jenkins-core` and `remoting` on the classpath, both present under
 `/var/cache/jenkins/war/WEB-INF/lib/`, because of its `FileCallable` inner class.
+
+### Session 25 addendum 11 — cln-app-terraform-pipeline was never a second-hop job
+
+The override did not fire on the real job. Diagnosed to the end rather than assumed, and the finding
+inverts an earlier claim.
+
+`cln-infra-terraform` — the repo this job actually plans — does not use a static `assume_role` block:
+
+```hcl
+locals {
+  role_enable = local.workspace["aws"]["role"] == "" ? [] : ["arn:aws:iam::…:role/…"]
+}
+provider "aws" {
+  region  = local.workspace_aws["region"]
+  profile = local.profile_enable
+  dynamic "assume_role" {
+    for_each = local.role_enable
+    content { role_arn = assume_role.value }
+  }
+}
+```
+
+**All 74 workspace configs in that repo set `role: ""`.** So `role_enable` is `[]`, the `dynamic` block
+renders zero times, and the provider authenticates **only** through `profile = "non_prod"` / `"prod"` —
+a shared-config profile the plugin already decorates. **There is no second hop.**
+
+This is confirmed by CloudTrail for #5620: **10 AssumeRole events, all carrying
+`jk-cln-infra-terraform-pipelines-cln-app-terraform-pipeline-5620`**, including the cross-account hop
+into 275595855473. That was the entire chain, not merely its first link — an earlier note read it as
+"first hop attributed, second hop lost", which was wrong.
+
+**So the plugin behaved correctly by writing nothing**, and this job is already fully attributed.
+
+**Correction to the record:** the "3 jobs with provider `assume_role`" figure is not reliable. It was
+derived from scanning for the string `assume_role`, which matches a `dynamic "assume_role"` block that
+may render zero times, and matches `assume_role_policy` on IAM resources. Of the 962 real `.tf` files
+scanned, the only genuine static `assume_role` providers live in `infra-cloudkeeper-app-services`
+(3 files) — a different repository, reached by different jobs.
+
+**What this means for the feature:** `TerraformOverride` remains correct and useful for the static
+shape it targets, and is proven end to end on canaries. It cannot name a `dynamic "assume_role"` block,
+because `role_arn` there comes from a `for_each` iterator that an override file cannot reproduce — and
+it correctly declines rather than guessing.
+
+**Before enabling it anywhere, confirm the target job actually renders a static `assume_role`.** Run
+the bundled `Scan` against that job's checked-out repository; `WOULD WRITE 0` means there is nothing to
+fix, not that the feature is broken.
