@@ -160,14 +160,25 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
     /**
      * Optional regular expression matched against the executing node's labels. Blank means every node.
      *
-     * <p>A cheaper rollout axis than job names when agents differ: one agent may carry a divergent AWS
-     * configuration, another may make no AWS calls at all.
+     * <p><b>No longer exposed in the UI.</b> It was offered as a cheaper rollout axis than job names for
+     * estates whose agents differ, but the cases it was meant for are handled structurally instead: a
+     * node with no AWS configuration has nothing contributed to it, and a node whose role cannot assume
+     * itself is detected and skipped. It was never used in any POC run, so the form entry was removed in
+     * 2.3 to keep the scoping story to one axis — job name.
+     *
+     * <p>The property is retained so existing configuration XML still loads and so the agent tests can
+     * pin themselves to a single node.
+     *
+     * @deprecated scope by job name instead.
      */
+    @Deprecated
     @CheckForNull
     public String getNodeLabelPattern() {
         return nodeLabelPattern;
     }
 
+    /** @deprecated see {@link #getNodeLabelPattern()}. */
+    @Deprecated
     @DataBoundSetter
     public void setNodeLabelPattern(@CheckForNull String nodeLabelPattern) {
         String trimmed = nodeLabelPattern == null ? "" : nodeLabelPattern.trim();
@@ -178,21 +189,28 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
     /**
      * Role ARN used to attribute AWS calls that name no profile. Blank leaves them exactly as they are.
      *
-     * <p>Calls that name no profile fall through the credential chain to the agent's base identity,
-     * whose session name is assigned by the platform and cannot be changed — so they are unattributable
-     * unless something assumes a role on their behalf. Setting this makes the generated {@code [default]}
-     * assume a role under the build's session name.
+     * <p><b>No longer exposed in the UI, and should not be set.</b> A single ARN for the whole
+     * controller is correct only while every agent shares one instance role, and a wrong value does not
+     * merely go unattributed — it makes every bare {@code aws} call <em>fail</em>, on whichever node
+     * happens to differ. During POC testing this field was used as a deliberate poison pill for exactly
+     * that reason, which is what a typo would do in production.
      *
-     * <p><b>Set this to the agent's own instance role.</b> Assuming a <em>different</em> role changes the
-     * principal ARN, and resource-based policies (bucket, key and repository policies) grant access by
-     * principal ARN — so a different role with identical permissions is still denied by every policy
-     * that names the original. Self-assume keeps the ARN, and therefore keeps every such grant working.
+     * <p>Superseded by {@link #isAttributeUnprofiledAsNodeRole()}, which resolves each node's real role
+     * over IMDS and proves the assume succeeds before using it. The form entry was removed in 2.3 so
+     * nobody can type an ARN here; the property is retained so existing XML still loads, and because the
+     * tests need a settable ARN to exercise the {@code [default]} emission (per-node resolution needs
+     * real IMDS and cannot run under {@code JenkinsRule}).
+     *
+     * @deprecated tick <em>Attribute unprofiled calls as the node's own instance role</em> instead.
      */
+    @Deprecated
     @CheckForNull
     public String getUnprofiledRoleArn() {
         return unprofiledRoleArn;
     }
 
+    /** @deprecated see {@link #getUnprofiledRoleArn()}. */
+    @Deprecated
     @DataBoundSetter
     public void setUnprofiledRoleArn(@CheckForNull String unprofiledRoleArn) {
         String trimmed = unprofiledRoleArn == null ? "" : unprofiledRoleArn.trim();
@@ -295,6 +313,13 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      * Rebuilding from the submitted form rather than relying on setters alone: an unchecked checkbox
      * and a cleared text field are both <em>absent</em> from the JSON, so without this a value could
      * never be turned off again once set.
+     *
+     * <p><b>{@code nodeLabelPattern} and {@code unprofiledRoleArn} are deliberately NOT reset here.</b>
+     * They no longer appear on the form, so the submitted JSON never carries them; resetting them would
+     * mean any admin pressing Save — even for an unrelated setting — silently erased a value that can
+     * now only be set through configuration XML. For {@code nodeLabelPattern} the erasure widens scope
+     * from one agent to every node on the controller, which is the dangerous direction. Only fields the
+     * form actually submits may be reset from the form.
      */
     @Override
     public boolean configure(StaplerRequest2 req, JSONObject json) throws FormException {
@@ -302,8 +327,6 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         managedAuthentication = false;
         jobNamePattern = null;
         jobNameExcludePattern = null;
-        nodeLabelPattern = null;
-        unprofiledRoleArn = null;
         attributeUnprofiledAsNodeRole = false;
         diagnostics = false;
         observeOnly = false;

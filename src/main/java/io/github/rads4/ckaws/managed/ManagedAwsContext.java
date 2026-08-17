@@ -127,11 +127,25 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
     private static final Map<String, Object> LOCKS = new ConcurrentHashMap<>();
 
     /**
-     * Each node's own instance-role ARN, resolved once per node. A node's instance profile does not
-     * change while it is attached, and a replaced agent gets a new node name, so this cannot go stale.
-     * Only successful resolutions are cached: a node that has no profile today may be given one.
+     * Each node's own instance-role ARN, resolved once per node. Failures are cached too, as
+     * {@link #UNRESOLVABLE}, because re-resolving costs two IMDS timeouts plus up to thirty seconds in
+     * the self-assume probe, under the preparation lock, on every build.
+     *
+     * <p><b>Known limitation.</b> The key is the node name, and nothing invalidates it. That is exact
+     * for ephemeral cloud agents, which get a fresh name per instance. It is <em>not</em> exact for a
+     * permanent agent, or an EC2 template with a fixed node name, that is destroyed and re-provisioned
+     * with a different instance role under the same name: the stale ARN would then be written into
+     * {@code [default]} and the new instance may not be permitted to assume it, failing its bare
+     * {@code aws} calls. No such agent exists on this controller today — every template is ephemeral —
+     * but a restart clears the cache, and keying on the resolved instance ID would close it properly.
      */
     private static final Map<String, String> NODE_ROLE_ARNS = new ConcurrentHashMap<>();
+
+    /**
+     * Sentinel for "this node has no usable instance role", since {@link ConcurrentHashMap} cannot hold
+     * a null value. Not a valid ARN, so it can never collide with a real one.
+     */
+    private static final String UNRESOLVABLE = " unresolvable";
 
     @Override
     protected Class<EnvironmentExpander> type() {
@@ -617,6 +631,7 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      * {@code [default]} is written and unprofiled calls are left exactly as the node had them.
      */
     @CheckForNull
+    @SuppressWarnings("deprecation") // the fixed ARN is retained for XML back-compat and for tests
     static String unprofiledRoleArnFor(
             CkAwsGlobalConfiguration configuration,
             FilePath workspace,
@@ -629,7 +644,14 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         String nodeName = node == null ? "" : node.getNodeName();
         String cached = NODE_ROLE_ARNS.get(nodeName);
         if (cached != null) {
-            return cached;
+            if (!UNRESOLVABLE.equals(cached)) {
+                return cached;
+            }
+            // Warn on every build, not only the one that discovered it. The cache is an optimisation;
+            // "this build's unprofiled calls are not attributed" is true of each of them, and an operator
+            // reading one build's console must be able to see it.
+            warnUnresolvable(listener);
+            return null;
         }
         String resolved;
         try {
@@ -641,14 +663,32 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             resolved = null;
         }
         if (resolved == null) {
-            warn(
-                    listener,
-                    "this node reports no instance role over IMDS, so calls naming no profile are left "
-                            + "exactly as the node had them");
+            // Cache the failure too. Without this every build on a node that is not EC2, has no instance
+            // profile, or whose role may not assume itself pays the cost again: two IMDS timeouts plus up
+            // to 30 seconds in the self-assume probe — and it is paid while holding the preparation lock,
+            // so it blocks the first step of the node block and serialises parallel branches.
+            NODE_ROLE_ARNS.put(nodeName, UNRESOLVABLE);
+            warnUnresolvable(listener);
             return null;
         }
         NODE_ROLE_ARNS.put(nodeName, resolved);
         return resolved;
+    }
+
+    private static void warnUnresolvable(@CheckForNull TaskListener listener) {
+        warn(
+                listener,
+                "this node's own instance role could not be resolved, or AWS will not permit it to "
+                        + "assume itself, so calls naming no profile are left exactly as the node had them");
+    }
+
+    /**
+     * Clears the per-node role cache. For tests: the map is static, so one test caching
+     * {@link #UNRESOLVABLE} under a node name short-circuits every later test in the same JVM — which
+     * would let a test pass while never executing the path it claims to cover.
+     */
+    static void forgetNodeRoles() {
+        NODE_ROLE_ARNS.clear();
     }
 
     /**

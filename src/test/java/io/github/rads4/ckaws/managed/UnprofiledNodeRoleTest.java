@@ -24,6 +24,16 @@ class UnprofiledNodeRoleTest {
 
     private static final String FIXED = "arn:aws:iam::123456789012:role/fixed-role";
 
+    /**
+     * The per-node cache is static and now caches failures too, so without this the first test to record
+     * an unresolvable node short-circuits every later one in the same JVM — and they would pass while
+     * never running the resolution path they exist to check.
+     */
+    @org.junit.jupiter.api.BeforeEach
+    void clearNodeRoleCache() {
+        ManagedAwsContext.forgetNodeRoles();
+    }
+
     @Test
     void usesTheConfiguredArnWhenPerNodeResolutionIsOff(JenkinsRule r, @TempDir Path tmp) throws Exception {
         CkAwsGlobalConfiguration config = CkAwsGlobalConfiguration.get();

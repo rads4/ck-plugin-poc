@@ -51,6 +51,20 @@ public final class ManagedAwsFreestyleEnvironment extends EnvironmentContributor
             throws InterruptedException {
         Map<String, String> variables = ManagedAwsContext.guarded(() -> contribute(r, listener));
         if (variables != null) {
+            // putAll, deliberately, despite the asymmetry with the Pipeline path.
+            //
+            // putIfAbsent looks like the additions-only invariant applied here, and it is not: the two
+            // paths compare against different baselines. Job#getEnvironment fills this map with the
+            // agent's OS environment and node properties BEFORE any EnvironmentContributor runs, whereas
+            // the Pipeline invariant compares only against the enclosing context-level expander. So
+            // putIfAbsent would defer to a node that merely exports AWS_CONFIG_FILE in its systemd unit
+            // — a setup locateNodeConfig explicitly supports and prefers — and silently drop attribution
+            // on that node while the console still printed "decorated as session jk-…".
+            //
+            // Losing attribution silently is worse than overriding a variable, and putAll is the
+            // behaviour every Freestyle canary in the POC was validated against. Distinguishing the
+            // node's ambient environment from a deliberate job-level choice needs build variables and
+            // wrappers, which is a change worth making with evidence rather than late in a rollout.
             envs.putAll(variables);
         }
     }

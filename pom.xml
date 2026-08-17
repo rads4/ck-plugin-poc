@@ -18,25 +18,44 @@
   <description>Centralizes AWS authentication and generic AWS CLI execution for Jenkins deployment pipelines.</description>
 
   <properties>
-    <revision>2.2</revision>
     <!--
-      Build a release, not a private snapshot: `mvn -Dchangelist= clean verify` produces a versioned
-      ck-aws whose version string is meaningful on a controller. A `-SNAPSHOT (private-<hash>-<user>)`
-      build cannot be identified after the fact.
+      SEMANTIC VERSIONING: major.minor.patch, adopted 2026-08-17.
+
+        major - a breaking change to the configuration contract or to what the plugin
+                guarantees about a build. Removing a form entry is NOT major while the
+                property still loads from existing XML.
+        minor - new capability, or a change in WHAT gets attributed.
+        patch - defect fix, or a UI/documentation change with no behaviour change.
+
+      This number is PROVISIONAL and is confirmed at install time, not now.
 
       VERSIONS TRACK INSTALLATIONS, NOT BUILDS.
       The number must change before an artifact is INSTALLED on a controller, so that
-      "the controller says 2.2" answers "which 2.2" unambiguously. A number that has been
-      installed is spent forever and must never be reused. A number that was only ever built
+      "the controller says 2.2.0" answers "which 2.2.0" unambiguously. A number that has
+      been installed is spent forever and must never be reused. A number only ever built
       locally is not spent, and may be re-taken by the build that actually ships.
 
-      History, so the record is not confusing: 2.1 is the version installed on CK production.
-      Builds numbered 2.2, 2.3 and 2.4 were produced during the August 2026 defect work and
-      their sha256 values were shared, but NONE was ever installed. 2.2 as shipped is the
-      build carrying all four fixes plus observe-only mode. Any artifact claiming to be an
-      earlier 2.2/2.3/2.4 is void and must not be installed - the first of them still
-      contained the DynamicContext shadowing defect.
+      History, so the record is not confusing. Under the old two-component scheme:
+        2.1  - installed on CK production (infra Jenkins). Master switch off.
+        2.2  - installed on the POC clone (sha256 f5150ba3...). The build validated
+               against real jobs: every canary, all 7 agent types, dev2/fluentd #119.
+        2.3  - installed on the POC clone (sha256 bc4d59e1...). Static ARN form entry
+               removed. Both POC installs are test installs; both numbers are spent.
+        2.4  - built, never installed. Node-label form entry removed.
+      Several earlier artifacts also called themselves 2.2/2.3/2.4 and are VOID - the
+      first of them still contained the DynamicContext shadowing defect. See MEMORY.md.
+
+      The X.Y.Z line therefore starts fresh. Since infra Jenkins is on 2.1 and is the
+      controller whose number actually matters, the next INFRA install is the one that
+      claims a number. Decide it then, and prefer a value that cannot be confused with a
+      spent two-component one when read on a controller.
+
+      Build a release, not a private snapshot: `mvn -Dchangelist= clean verify` produces a
+      versioned ck-aws whose version string is meaningful on a controller. A default build
+      is `-SNAPSHOT (private-<hash>-<user>)`, which is deliberately NOT installable - that
+      is what keeps the number provisional until installation.
     -->
+    <revision>2.2.0</revision>
     <changelist>-SNAPSHOT</changelist>
     <!--
       Baseline is pinned to CloudKeeper's actual Jenkins version (2.479.2) rather than the

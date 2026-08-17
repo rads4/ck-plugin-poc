@@ -39,20 +39,43 @@ project.**
 | ~~M12i — production incident investigation (Gradle 403)~~ | **Closed: the plugin was not the cause.** See below |
 | v2.0 — unprofiled attribution, output verification, runtime controls | Superseded by 2.1 before wide rollout |
 | v2.1 — Freestyle coverage, trailing-blank fix, no-role profiles | Implemented, 201 tests — **this is what is installed on CK production** |
-| **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only, additions-only environment invariant, per-node unprofiled attribution** | **Implemented, 220 tests, `ck-aws 2.2` (`sha256 f5150ba3…`). Installed and validated on the POC clone; NOT yet on CK production** |
+| **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only, additions-only environment invariant, per-node unprofiled attribution** | Implemented, 220 tests, `ck-aws 2.2` (`sha256 f5150ba3…`). Installed and validated on the POC clone. Superseded by 2.3 |
+| v2.3 — static unprofiled ARN removed from the form | Implemented. **Installed on the POC clone, so the number is spent** |
+| **Current (unnumbered) — node-label entry removed, plus six code-review fixes** | **Implemented, 228 tests. Builds as `2.2.0-SNAPSHOT`; the release number is claimed at install time** |
 
-**Versioning: versions track INSTALLATIONS, not builds.** The number must change before an
-artifact is *installed* on a controller, so that "the controller says 2.2" answers "which 2.2"
-unambiguously. A number that has been installed is **spent forever** and must never be reused.
-A number that was only ever built locally is **not** spent, and may be re-taken by the build
-that actually ships.
+**Versioning: `major.minor.patch`, and versions track INSTALLATIONS, not builds.**
 
-Applying that rule: 2.1 is installed on CK production. Builds numbered 2.2, 2.3 and 2.4 were
-produced during the August 2026 defect work and their hashes circulated, but none was ever
-installed — so the build that ships re-takes **2.2**. Only
-`sha256 b4c94c784efc697662d9578b4f0d1bad1c3398d7c2a67744bc7ae7d92e558f45` may be installed;
-earlier artifacts claiming 2.2/2.3/2.4 are void, and the first of them still contained the
-shadowing defect. Superseded hashes are listed in MEMORY.md, Session 23.
+- **major** — breaking change to the configuration contract or to what the plugin guarantees
+  about a build. Removing a form entry is *not* major while the property still loads from XML.
+- **minor** — new capability, or a change in what gets attributed.
+- **patch** — defect fix, or a UI/doc change with no behaviour change.
+
+The number must change before an artifact is *installed* on a controller, so that "the
+controller says 2.2.0" answers "which 2.2.0" unambiguously. A number that has been installed is
+**spent forever** and must never be reused. A number only ever built locally is **not** spent.
+
+**The number is provisional until installation.** A plain `mvn verify` yields
+`2.2.0-SNAPSHOT (private-<hash>-<user>)`, which is deliberately not installable; a release needs
+`mvn -Dchangelist= clean verify`. Infra Jenkins is on **2.1** and is the only controller whose
+number really matters — the two POC installs (2.2, 2.3) were test installs that spent those
+numbers. When choosing the infra number, prefer one that cannot be misread as a spent
+two-component version.
+
+Applying that rule, as of 2026-08-17:
+
+| Number | Status |
+|---|---|
+| **2.1** | Installed on **CK production**. Master switch off. Spent |
+| **2.2** (`f5150ba3…`) | Test install on the POC clone. The last build validated against real jobs. Spent |
+| **2.3** (`bc4d59e1…`) | Test install on the POC clone. Spent |
+| 2.4 | Built, never installed, superseded by the code-review fixes. **Not** spent |
+
+Several *earlier* artifacts also called themselves 2.2, 2.3 or 2.4 during the August 2026 defect
+work and their hashes circulated. **All of those are void** — the first still contained the
+`DynamicContext` shadowing defect. Superseded hashes are listed in MEMORY.md, Session 23.
+
+There is deliberately **no current release artifact**: development builds are
+`2.2.0-SNAPSHOT (private-…)`. Build the release at install time and record its hash then.
 
 This rule replaces the older "raise `<revision>` before any artifact leaves the build machine",
 which produced a version inflation of three unused numbers. The problem it was written for is
@@ -70,26 +93,35 @@ below is something that was learned the hard way, not a precaution.
 ### 1. Install the binary that was actually tested — do not rebuild
 
 `.hpi` jars embed build timestamps, so **`mvn clean verify` on unchanged source
-produces a different `sha256` every time.** The validated artifact is
-`f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523` — the binary every
-canary, all 7 agent types and `dev2/fluentd #119` ran against.
+produces a different `sha256` every time.** Build releases with
+`mvn -Dchangelist= clean verify`, or the manifest says `2.3-SNAPSHOT (private-…)`.
 
-A local `mvn clean` has since deleted it. **The only surviving copy is on
-`poc-jenkins-2` (`i-0cdd407bce366be0f`) at `/var/lib/jenkins/plugins/ck-aws.hpi`** —
-retrieve it from there. Rebuilding instead is defensible (identical source, 220 tests
-green) but then say so plainly: the shipped hash was never the one under test.
+**There is no current release artifact.** Development builds are `2.2.0-SNAPSHOT` and are not
+installable by design. Build the release only when you install it, with
+`mvn -Dchangelist= clean verify`, and record its sha256 here at that moment.
+
+`poc-jenkins-2` currently runs **2.3** (`bc4d59e1…`) at
+`/var/lib/jenkins/plugins/ck-aws.jpi` — note `.jpi`, Jenkins renames what it installs.
+That build predates the six code-review fixes, so **the clone is not running current code**.
+
+The form changes (two entries removed) carry no behaviour change, but the six code-review
+fixes that followed them do — and none of it has been re-validated against a real job. The 2.2 binary that *was* (`f5150ba3…`,
+every canary, all 7 agent types, `dev2/fluentd #119`) is preserved on the instance at
+`/var/lib/poc-artifacts/ck-aws-2.2-VALIDATED-f5150ba3.jpi`. **Keep that until 2.3 has
+its own real-job evidence**, and retrieve it before the instance is terminated.
 Never run `mvn clean` while a validated artifact is the only copy.
 
 ### 2. Settings to apply at install time
+
+Eight fields. If you see *Attribute unprofiled calls as* (a text box) or *Apply on nodes
+labelled*, you are running an older build.
 
 | Field | Value | Why |
 |---|---|---|
 | *Managed authentication* | **off** at first | Install and restart with it off; turn on afterwards without a restart |
 | *Apply to jobs matching* | blank | Observe-only makes full scope safe |
 | *Except jobs matching* | blank | Reserved as the incident switch |
-| *Apply on nodes labelled* | blank | Unused |
-| *Attribute unprofiled calls as* (static ARN) | **BLANK** | Deprecated footgun — a wrong value breaks every bare `aws` call |
-| *…as the node's own instance role* | **ticked** | This is what audits ~98% |
+| *Attribute unprofiled calls as the node's own instance role* | **ticked** | This is what audits ~98% |
 | *AWS profiles* | empty | Never once used |
 | *Observe only* | **ticked** | Enforce only after reading a day of real traffic |
 | *Diagnostics* | ticked | Turn off once the rollout is settled |
@@ -1549,7 +1581,16 @@ by the Freestyle path for free.
 
 ## Configuration surface — what is load-bearing and what is not
 
-Ten fields ship. They are not equally valuable, and one is a hazard.
+**2.3 removed two form entries.** *Attribute unprofiled calls as* (the static ARN) and *Apply on
+nodes labelled* are gone from the UI; both properties are retained `@Deprecated` so existing XML
+still loads and the tests keep a settable ARN and a way to pin to one node. The form is now **eight
+fields**. What follows describes the full property set, including the two that are no longer typeable.
+
+Two fields reviewed as "dead weight" were kept after tracing their callers, and the reasoning is
+worth not repeating: **`profiles` is the configuration source for `CkAwsWithProfileStep`** — removing
+it deletes a shipped feature, not clutter — and **`credentialSource` is written into every generated
+`[default]`** (`credential_source = Ec2InstanceMetadata`), so it is functional output even though its
+value has never varied.
 
 **Load-bearing — do not remove:**
 
@@ -1561,25 +1602,27 @@ Ten fields ship. They are not equally valuable, and one is a hazard.
 | *Observe only* | The rollout mechanism; full scope at zero risk |
 | *Diagnostics* | Every piece of POC evidence came from it |
 
-**Dead weight — kept only because removing them is a code change:**
+**Removed from the form in 2.3:**
 
-- ***Attribute unprofiled calls as* (the static role ARN) is a footgun.** It was
+- ***Attribute unprofiled calls as* (the static role ARN) was a footgun.** It was
   used as a deliberate poison pill during testing — pointing it at a nonexistent
   ARN breaks every bare `aws` call in every build, which is exactly what a typo
-  would do. It is fully superseded by the per-node checkbox, which resolves each
-  node's real role and *verifies the assume succeeds* before using it. Two fields
-  for one concept, where the older one is strictly worse. **Leave blank; remove it
-  in the next version that touches this file.**
+  would do. Fully superseded by the per-node checkbox, which resolves each node's
+  real role and *verifies the assume succeeds* before using it.
 - ***Apply on nodes labelled*** — no demonstrated use case. Its original
-  justification (agents that differ, or make no AWS calls) is now handled
+  justification (agents that differ, or make no AWS calls) is handled
   structurally: a node with no config gets nothing contributed, and a node that
-  cannot self-assume is detected and skipped. Never used in any test.
-- ***AWS profiles*** (the repeatable list) — **never once used.** Every diagnostic
-  block in the entire POC printed `sections appended: []`. The agent's own
-  `~/.aws/config` has always been the source of truth. Harmless, not load-bearing.
+  cannot self-assume is detected and skipped. Never used in any test or run.
+
+**Kept after tracing callers — these are NOT dead:**
+
+- ***AWS profiles*** (the repeatable list) — every diagnostic block in the POC
+  printed `sections appended: []`, so it has never appended a profile. But it is
+  also the configuration source for `CkAwsWithProfileStep`, the M11 override layer.
+  Removing it deletes a shipped feature.
 - ***Agent base identity*** — only affects profiles the plugin writes, which in
-  practice is just `[default]`, and on EC2 it is always `Ec2InstanceMetadata`. It
-  would matter if agents moved to ECS or EKS.
+  practice is just `[default]` — but it *is* written there, on every build. On EC2
+  it is always `Ec2InstanceMetadata`; it would matter if agents moved to ECS or EKS.
 
 *Apply to jobs matching* sits in between: largely redundant now that observe-only
 surveys everything at zero risk, but it costs nothing and was used constantly.

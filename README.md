@@ -10,20 +10,37 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 2.2 — implemented, 220 tests. 2.1 is what is installed on CK production.**
+**Status: 228 tests green. The release number is provisional until installation.
+2.1 is what is installed on CK production.**
 
-> **Versions track installations, not builds.** A number must change before an
-> artifact is *installed* on a controller, so that "the controller says 2.2"
-> answers "which 2.2" unambiguously. A number that has been installed is spent
-> forever; a number only ever built locally is not spent and may be re-taken.
-> Builds numbered 2.2, 2.3 and 2.4 were produced during the August 2026 defect
-> work and their hashes were circulated, but **none was ever installed**, so the
-> shipping build re-takes **2.2**.
+> **Versioning is `major.minor.patch`** (adopted 2026-08-17):
 >
-> **Only `sha256 f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523`
-> may be installed.** Every earlier artifact calling itself 2.2, 2.3 or 2.4 is void,
-> including `b4c94c78…` (no environment invariant), `edde1e04…` (misleading observe-only
-> diagnostics) and `4cc0aada…` (no per-node unprofiled resolution). See [MEMORY.md](MEMORY.md) for the superseded hashes.
+> - **major** — a breaking change to the configuration contract, or to what the
+>   plugin guarantees about a build. Removing a form entry is *not* major while the
+>   property still loads from existing XML.
+> - **minor** — new capability, or a change in *what gets attributed*.
+> - **patch** — defect fix, or a UI/doc change with no behaviour change.
+>
+> **Versions track installations, not builds.** A number must change before an
+> artifact is *installed* on a controller, so that "the controller says 2.2.0"
+> answers "which 2.2.0" unambiguously. A number that has been installed is spent
+> forever; a number only ever built locally is not spent and may be re-taken.
+>
+> Development builds are deliberately **not installable**: a plain
+> `mvn verify` produces `2.2.0-SNAPSHOT (private-<hash>-<user>)`. A release needs
+> `mvn -Dchangelist= clean verify`, and the number is confirmed **at install time**.
+>
+> | Number | Where it stands |
+> |---|---|
+> | 2.1 | On **CK production** today, master switch off. The only install that matters |
+> | 2.2 — `f5150ba3…` | Test install on the POC clone. The build validated against real jobs — every canary, all 7 agent types, `dev2/fluentd #119`. **Spent** |
+> | 2.3 — `bc4d59e1…` | Test install on the POC clone; static ARN form entry removed. **Spent** |
+> | 2.4 | Built, never installed, and now superseded by the review fixes. Not spent |
+>
+> Every *earlier* artifact calling itself 2.2, 2.3 or 2.4 is void — including
+> `b4c94c78…` (no environment invariant), `edde1e04…` (misleading observe-only
+> diagnostics) and `4cc0aada…` (no per-node unprofiled resolution). See
+> [MEMORY.md](MEMORY.md) for the full list of superseded hashes.
 
 Two unmodified production pipelines ran with Managed Authentication on and were
 fully attributed in CloudTrail — a prod ECS deployment (25 events) and a non-prod
@@ -180,9 +197,7 @@ unclassified:
     managedAuthentication: true            # off by default
     jobNamePattern: "uat/.*"               # optional; blank means EVERY job
     jobNameExcludePattern: ""              # optional; wins over the include pattern
-    nodeLabelPattern: ""                   # optional; blank means every node
     attributeUnprofiledAsNodeRole: true    # resolve each node's OWN role over IMDS
-    unprofiledRoleArn: ""                  # deprecated — leave blank, see below
     observeOnly: false
     diagnostics: false
     credentialSource: "Ec2InstanceMetadata"
@@ -198,12 +213,22 @@ unclassified:
 | `managedAuthentication` | `false` | Master switch. No restart to change, and changing it never disturbs a running build |
 | `jobNamePattern` | blank = **all jobs** | Phased rollout. Full-string match against a job's *full* name. An unparseable pattern matches nothing, so a typo narrows rather than widens |
 | `jobNameExcludePattern` | blank = exclude nothing | Evaluated after include and wins. The incident switch. An unparseable pattern excludes nothing |
-| `nodeLabelPattern` | blank = every node | Matched in full against each of the node's labels and its node name; the built-in node matches `built-in` |
-| `attributeUnprofiledAsNodeRole` | `false` | Resolves each node's own instance role over IMDS and verifies it can assume itself. **This is what attributes the ~98% of calls that name no profile.** Overrides `unprofiledRoleArn` entirely |
-| `unprofiledRoleArn` | blank = leave them alone | **Deprecated — leave blank.** A single static ARN is only ever correct while every agent shares one role, and a wrong value breaks every unprofiled call. Superseded by the setting above |
+| `attributeUnprofiledAsNodeRole` | `false` | Resolves each node's own instance role over IMDS and verifies it can assume itself. **This is what attributes the ~98% of calls that name no profile** |
 | `observeOnly` | `false` | Prepares and logs everything, exports nothing. See below |
 | `diagnostics` | `false` | Prints what was found and changed. Non-sensitive; no restart |
 | `credentialSource` | `Ec2InstanceMetadata` | How agents obtain their base identity, for profiles the plugin *writes*. Also `EcsContainer`, `Environment` |
+| `profiles` | empty | Appended **only** for profiles the agent does not define, and the configuration source for the `ckAwsWithProfile` step |
+
+### Two properties are no longer in the form
+
+`unprofiledRoleArn` and `nodeLabelPattern` still load from existing XML but have no UI entry.
+
+`unprofiledRoleArn` was a single static ARN for the whole controller. That is correct only while
+every agent shares one instance role, and a wrong value does not merely go unattributed — it makes
+every bare `aws` call **fail** on whichever node differs. It is superseded by
+`attributeUnprofiledAsNodeRole`, which resolves each node's real role and proves the assume
+succeeds first. `nodeLabelPattern` was a second scoping axis that no run ever needed; the cases it
+was meant for are handled structurally. **Leave both unset.**
 
 ### What observe-only actually does
 

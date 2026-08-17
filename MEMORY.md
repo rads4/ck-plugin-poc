@@ -9,8 +9,11 @@
 | | |
 |---|---|
 | **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is being audited today. Infra has not been restarted, reconfigured or installed to at any point |
-| **Shipping build** | **2.2**, `sha256 f5150ba33076de2ff1cf710a7be962d399804ba5a488cb372afd552f9754e523`, 220 tests. Every earlier 2.2/2.3/2.4 hash is void |
-| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. The validated `f5150ba3` binary was deleted locally by `mvn clean`; the only copy is on `poc-jenkins-2` at `/var/lib/jenkins/plugins/ck-aws.hpi`. Rebuilding gives a different hash from identical source — see addendum 10 |
+| **Versioning** | **`major.minor.patch`** since 2026-08-17. Development builds are `2.2.0-SNAPSHOT (private-…)` and are **deliberately not installable**; the release number is claimed at install time with `mvn -Dchangelist= clean verify` |
+| **Current code** | 228 tests green. Two form entries removed, plus **six code-review fixes**. No release artifact exists — build one only when installing |
+| **On the POC clone** | **2.3**, `bc4d59e1…` — installed, so that number is spent. **Predates the six fixes**, so the clone is not running current code |
+| **Last build validated against real jobs** | **2.2** `f5150ba3…` — preserved on the instance at `/var/lib/poc-artifacts/ck-aws-2.2-VALIDATED-f5150ba3.jpi`. 2.3 changes only the form, but has no real-job evidence of its own yet |
+| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. Build releases with `mvn -Dchangelist= clean verify`; rebuilding gives a different hash from identical source — see addendum 10 |
 | **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f`, `10.20.80.237` — built from a post-migration AMI, running 2.2. See `poc-jenkins-setup/STATE.md` |
 
 ### What 2.2 contains beyond 2.1
@@ -3031,3 +3034,160 @@ Consequence for the "one hash is the installable artifact" convention: it identi
 are now archived outside the repo at
 `poc-jenkins-setup/artifacts/ck-aws-<version>-<short-sha>.hpi` (never committed — the
 repo is public).
+
+### Session 25 — 2026-08-17 — configuration surface trimmed (2.3)
+
+The UI review from addendum 9 was implemented. **Two form entries removed; no behaviour change.**
+
+- ***Attribute unprofiled calls as* (static ARN)** — the footgun. Superseded by the per-node
+  checkbox, which resolves each node's real role and probes the assume first.
+- ***Apply on nodes labelled*** — a second scoping axis no run ever needed.
+
+Both properties are **retained `@Deprecated`**, not deleted, for two reasons: existing configuration
+XML still loads without an XStream warning, and six test classes need a settable ARN to exercise the
+`[default]` emission — per-node resolution needs real IMDS and cannot run under `JenkinsRule`.
+Removing the *form entry* removes the hazard; removing the *property* would cost test coverage.
+
+**Two fields reviewed as dead weight were kept after tracing their callers.** Worth not
+re-litigating:
+
+- **`profiles` is not dead** — it is the configuration source for `CkAwsWithProfileStep`, the M11
+  override layer. `sections appended: []` in every diagnostic block means it has never *appended a
+  profile*, which is a different claim from "nothing reads it".
+- **`credentialSource` is not dead** — it is written into every generated `[default]` as
+  `credential_source = Ec2InstanceMetadata`. Its value has never varied, but it is functional output,
+  and the ECS/EKS agent case is real.
+
+Form went 10 → 9 (2.3) → **8 fields** (2.4).
+
+**Two versions, because the rule bit mid-session.** 2.3 (`bc4d59e1…`) removed the static ARN and was
+**installed on `poc-jenkins-2`** — manifest confirmed `Plugin-Version: 2.3`, and `grep
+unprofiledRoleArn` against the saved configuration XML returns **0**, so the `999999999999` poison
+pill from testing is not lurking behind the removed field. That spent the number. The node-label
+removal that followed therefore had to become **2.4** (`e3ad90b0…`, 220 tests), which is built and
+archived but **not installed anywhere**.
+
+The lesson is procedural: *finish the whole UI change before installing anything.* Installing an
+intermediate build spends a version number for a state nobody keeps.
+
+**Build releases with `mvn -Dchangelist= clean verify`.** Without it the manifest says
+`2.3-SNAPSHOT (private-<sha>-<user>)`, which is not installable as a release.
+
+**The installed plugin file is `ck-aws.jpi`, not `.hpi`** — Jenkins renames what it installs. The
+pre-install checklist said `.hpi` and the first backup attempt found nothing.
+
+### Session 25 addendum — code review, six fixes, and semantic versioning
+
+A full review of the repo produced nine findings. Six were fixed; three are recorded as known
+limitations. **One of the six was a bug introduced earlier the same session**, which is the argument
+for reviewing your own work rather than trusting that a green suite means correct.
+
+**Fixed:**
+
+1. **`AwsConfigOverlay.emissionFor` treated "no `role_arn`" as "uses the agent's base identity".**
+   That is false for five shapes, and they fail differently. An **SSO** profile given the assume-role
+   triple authenticates as the agent's instance role in the wrong account — it *succeeds*, as the
+   wrong principal, which is worse than failing. A **`source_profile`** profile gains
+   `credential_source`, which botocore rejects outright (`InvalidConfigError`), failing every call.
+   **`credential_process`**, static keys and web identity all have their identity silently replaced.
+   None was caught by the duplicate-key guard, because the keys differ from the ones being written.
+   Now guarded by `establishesIdentity(sectionKeys)`. **8 new tests** in `IdentityBearingProfilesTest`,
+   including a regression guard that a genuinely plain profile *is* still attributed — otherwise
+   "leave identity-bearing profiles alone" could be satisfied by leaving everything alone.
+2. **The `ASSIGNMENT` regex matched indented continuation lines.** AWS nested configuration
+   (`[services local]` with indented `endpoint_url` under `dynamodb =` and `s3 =`) made the
+   duplicate-key check see `endpoint_url` twice and reject a file botocore parses happily — costing
+   that node **all** attribution. Leading whitespace is no longer allowed, matching configparser.
+3. **Removing the two form entries made the first UI Save erase them.** `configure()` still reset
+   `nodeLabelPattern` and `unprofiledRoleArn` to null before `bindJSON`, but the form no longer
+   submits them, so nothing restored them. For `nodeLabelPattern` the erasure *widens* scope from one
+   agent to every node — the dangerous direction. **Rule: only fields the form actually submits may be
+   reset from the form.**
+4. **Failed per-node role resolution was never cached**, so a node that is not EC2, has no instance
+   profile, or may not self-assume paid two IMDS timeouts plus up to 30 s of `sts assume-role` on
+   *every build* — while holding the preparation lock. Negatives now cache via an `UNRESOLVABLE`
+   sentinel. The warning text was also wrong for the self-assume-denied case and now covers both.
+5. **The Freestyle path used `envs.putAll`, overwriting the build's own variables** — contradicting
+   the additions-only invariant the Pipeline path enforces by comparing expansions. A Freestyle job
+   setting its own `AWS_CONFIG_FILE` had it silently replaced. Now `putIfAbsent`.
+
+**Recorded, not fixed:**
+
+- `NODE_ROLE_ARNS` is keyed on node name with no invalidation. Exact for ephemeral cloud agents
+  (fresh name per instance); **stale for a permanent agent re-provisioned with a different role under
+  the same name**. No such agent exists on this controller and a restart clears the cache.
+- `stillOnDisk` does a remote `FilePath.exists()` per step, and `wouldRemoveSomething` expands two
+  environments per step. Measurable on a high-latency agent with a several-hundred-step pipeline.
+- `buildWorkspace` does not fix the `dir()` case for concurrent builds (`job@2` is not `inside`
+  `getWorkspaceFor`), so those fall back to the current path.
+
+**Versioning moved to `major.minor.patch`.** Development builds are `2.2.0-SNAPSHOT (private-…)` and
+are deliberately **not installable**; the release number is claimed at install time. Infra Jenkins is
+on **2.1** and is the only controller whose number matters — 2.2 and 2.3 were POC test installs and
+are spent. The superseded `ck-aws-2.4-e3ad90b0.hpi` artifact was deleted rather than kept, because a
+numbered artifact matching no current source state is exactly the confusion the rule exists to prevent.
+
+### Session 25 addendum 2 — the second review found two of the six fixes were WRONG
+
+A verification pass over the six fixes rejected two of them. Both were mine, both were made the same
+day, and **both would have caused the exact production outage the code they touched exists to
+prevent.** A green suite proved nothing, because no test covered the shapes that break.
+
+**The root cause of both: one regex was doing INI parsing it was not equipped for.**
+
+The `ASSIGNMENT` pattern was changed to forbid leading whitespace, on the reasoning that configparser
+treats indented lines as continuations. That reasoning is half right. **An indented line is a
+continuation only when its indent exceeds the previous option's** — a *uniformly* indented profile is
+completely valid. Verified against Python's `RawConfigParser`, which is what botocore uses:
+
+```
+[profile ops]
+    role_arn = arn:aws:iam::2:role/ops     -> parses to a real role_arn
+```
+
+Under the change, that `role_arn` was invisible, so the section looked like it assumed nothing, got
+the assume-role triple appended, and the file then genuinely declared `role_arn` twice →
+`DuplicateOptionError` → **every AWS call in the build fails, not just that profile's.** And because
+`duplicateKey()` used the same regex, `validate()` was blind to the corruption it had just written.
+Both guards failed in the same direction, which is the failure mode this plugin most needs to avoid.
+
+Second defect in the same area: **`ASSIGNMENT` only matched `=`.** configparser's default delimiters
+are `('=', ':')` and botocore does not override them, so `sso_session: ck` is a real key — and a
+colon-delimited SSO profile was invisible to the new identity guard, defeating the whole point of it.
+
+**Fixed properly:** one `optionKeysOf(...)` helper implementing configparser's actual rule
+(indent-relative continuation, both delimiters), used by *both* `describe()` and `duplicateKey()` so
+writer and guard can never disagree again. `emissionForSlice(...)` now derives `role_arn` /
+`role_session_name` presence from that helper instead of accumulating it line by line.
+
+**Verified end-to-end, not just by unit test:** generated output for six risky shapes was fed to real
+`configparser`. All parse; indented and tab-indented profiles keep their own `role_arn`; colon-SSO and
+`source_profile` are untouched; a genuinely plain profile is still attributed.
+
+**Fix 5 (`putIfAbsent` on the Freestyle path) was reverted to `putAll`.** It looked like the
+additions-only invariant applied to Freestyle. It is not: `Job#getEnvironment` fills that map with the
+**agent's OS environment and node properties** before any `EnvironmentContributor` runs, whereas the
+Pipeline invariant compares only against the enclosing *context-level* expander. So `putIfAbsent`
+would defer to a node that merely exports `AWS_CONFIG_FILE` in its systemd unit — a setup
+`locateNodeConfig` explicitly prefers — and **silently drop attribution while the console still
+printed "decorated as session jk-…"**. Silent loss of attribution is worse than overriding a variable,
+and `putAll` is what every Freestyle canary was validated against.
+
+**Also fixed:** the unresolvable-node warning fired once per node *ever* (it sat inside the cache-miss
+branch), so most builds on such a node said nothing; it now warns every build. Added
+`forgetNodeRoles()` plus a `@BeforeEach` — the static cache meant one test recording an unresolvable
+node short-circuited every later test in the JVM, so those tests could pass without running the path
+they claim to cover. And one of the eight new tests was **vacuous**: it included `role_session_name`,
+which sets `pinned` and returns before the identity guard is consulted, so it passed with the guard
+reverted.
+
+**231 tests.** The lesson worth carrying: *verify a fix against the real parser, not against the
+reasoning that motivated it.* Two independent reviews were needed, and the second one caught what the
+first one's fixes broke.
+
+**Known, recorded, not fixed** (pre-existing; each needs a design decision, none is a regression):
+`DefaultProcessRunner` leaves the child's stdin an open pipe with no timeout and runs on the
+controller JVM; `configure()` blanks `profiles` in place while build threads read it unsynchronised;
+`NODE_ROLE_ARNS` never invalidates for a permanent agent re-provisioned under the same node name;
+per-step remote I/O in `stillOnDisk`; `buildWorkspace` does not cover `job@2` concurrent builds;
+failed-assume stderr is echoed unmasked.

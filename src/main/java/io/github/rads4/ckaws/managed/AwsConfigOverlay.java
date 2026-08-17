@@ -40,8 +40,71 @@ public final class AwsConfigOverlay {
     /** A section header: {@code [default]}, {@code [profile x]}, {@code [sso-session y]}, anything. */
     private static final Pattern SECTION = Pattern.compile("^\\s*\\[([^\\]]*)\\]\\s*$");
 
-    /** {@code key = value} or {@code key=value}, at any indentation. */
-    private static final Pattern ASSIGNMENT = Pattern.compile("^\\s*([A-Za-z0-9_.-]+)\\s*=.*$");
+    /**
+     * A {@code key = value} or {@code key: value} line, capturing its indentation.
+     *
+     * <p><b>Both delimiters matter.</b> configparser's defaults are {@code ('=', ':')} and botocore does
+     * not override them, so {@code sso_session: ck} is a real key. Matching only {@code =} left
+     * colon-delimited profiles invisible to every check in this class — including the identity guard, so
+     * an SSO profile written with colons would still have been given the assume-role triple.
+     *
+     * <p>Indentation is captured rather than banned. See {@link #optionKeysOf}.
+     */
+    private static final Pattern ASSIGNMENT = Pattern.compile("^(\\s*)([A-Za-z0-9_.-]+)\\s*[=:].*$");
+
+    /**
+     * The option keys a section declares, applying configparser's actual continuation rule.
+     *
+     * <p>An indented line is a continuation of the previous option <b>only when its indent exceeds that
+     * option's</b> — not whenever it is indented at all. Both of these are legal and both occur:
+     *
+     * <pre>
+     * [profile ops]            [services local]
+     *     role_arn = arn:…     dynamodb =
+     *     credential_source =    endpoint_url = http://localhost:8000
+     *                          s3 =
+     *                            endpoint_url = http://localhost:9000
+     * </pre>
+     *
+     * <p>On the left every key is uniformly indented and all of them are real; on the right the indented
+     * lines are continuations and {@code endpoint_url} is not a key of the section at all. Getting this
+     * wrong is dangerous in both directions, and both directions have bitten this plugin:
+     *
+     * <ul>
+     *   <li>Treating indented lines as keys sees {@code endpoint_url} twice, so the duplicate-key guard
+     *       rejects a file botocore parses happily and the node loses all attribution.
+     *   <li>Treating them as continuations misses {@code role_arn} on the left, so the section looks like
+     *       it assumes nothing, gets the assume-role triple appended, and the file then really does
+     *       declare {@code role_arn} twice — {@code DuplicateOptionError}, and <em>every</em> AWS call in
+     *       the build fails, not just that profile's.
+     * </ul>
+     *
+     * <p>This is the single parser for both {@link #describe} and {@link #duplicateKey}: when the two
+     * disagreed, the guard was blind to exactly the corruption the writer produced.
+     *
+     * @param lines the section's lines, header included if present
+     * @return each option key, lower-cased, in declaration order
+     */
+    private static List<String> optionKeysOf(List<String> lines) {
+        List<String> keys = new ArrayList<>();
+        int optionIndent = -1;
+        for (String line : lines) {
+            if (line.trim().isEmpty() || SECTION.matcher(line).matches()) {
+                continue;
+            }
+            Matcher assignment = ASSIGNMENT.matcher(line);
+            if (!assignment.matches()) {
+                continue;
+            }
+            int indent = assignment.group(1).length();
+            if (optionIndent >= 0 && indent > optionIndent) {
+                continue; // a continuation of the option above, not a key of this section
+            }
+            optionIndent = indent;
+            keys.add(assignment.group(2).toLowerCase(Locale.ROOT));
+        }
+        return keys;
+    }
 
     private static final String ROLE_ARN = "role_arn";
     private static final String ROLE_SESSION_NAME = "role_session_name";
@@ -107,25 +170,14 @@ public final class AwsConfigOverlay {
 
         int start = 0;
         boolean inSection = false;
-        boolean assumesRole = false;
-        boolean pinned = false;
         boolean sawDefault = false;
         boolean defaultAttributed = false;
-        // Keys the current section already declares. A key written twice makes the whole file
-        // unparseable — not merely the section — so nothing already present may be written again.
-        Set<String> sectionKeys = new LinkedHashSet<>();
 
         for (int i = 0; i < lines.size(); i++) {
             Matcher header = SECTION.matcher(lines.get(i));
             if (header.matches()) {
-                Emission emission = emissionFor(
-                        currentSection,
-                        inSection,
-                        assumesRole,
-                        pinned,
-                        unprofiledRoleArn,
-                        credentialSource,
-                        sectionKeys);
+                Emission emission = emissionForSlice(
+                        lines.subList(start, i), currentSection, inSection, unprofiledRoleArn, credentialSource);
                 if (emission.decorates() && currentSection != null) {
                     decorated.add(currentSection);
                     defaultAttributed |= DEFAULT_SECTION.equals(currentSection);
@@ -135,24 +187,11 @@ public final class AwsConfigOverlay {
                 present.add(currentSection);
                 sawDefault |= DEFAULT_SECTION.equals(currentSection);
                 inSection = true;
-                assumesRole = false;
-                pinned = false;
-                sectionKeys = new LinkedHashSet<>();
                 start = i;
-                continue;
-            }
-            if (inSection) {
-                Matcher assignment = ASSIGNMENT.matcher(lines.get(i));
-                if (assignment.matches()) {
-                    String key = assignment.group(1).toLowerCase(Locale.ROOT);
-                    sectionKeys.add(key);
-                    assumesRole |= ROLE_ARN.equals(key);
-                    pinned |= ROLE_SESSION_NAME.equals(key);
-                }
             }
         }
-        Emission last = emissionFor(
-                currentSection, inSection, assumesRole, pinned, unprofiledRoleArn, credentialSource, sectionKeys);
+        Emission last = emissionForSlice(
+                lines.subList(start, lines.size()), currentSection, inSection, unprofiledRoleArn, credentialSource);
         if (last.decorates() && currentSection != null) {
             decorated.add(currentSection);
             defaultAttributed |= DEFAULT_SECTION.equals(currentSection);
@@ -195,6 +234,29 @@ public final class AwsConfigOverlay {
      * <p>A pinned {@code role_session_name} always wins: an administrator set it deliberately, and
      * overriding a deliberate decision is worse than losing attribution.
      */
+    /**
+     * Decides a section's emission from its own lines, using {@link #optionKeysOf} as the single source
+     * of truth for what the section declares. Deriving {@code role_arn} / {@code role_session_name}
+     * presence here — rather than accumulating it line by line while scanning — is what keeps the
+     * writer and the duplicate-key guard from disagreeing about the same file.
+     */
+    private static Emission emissionForSlice(
+            List<String> sectionLines,
+            @CheckForNull String section,
+            boolean inSection,
+            @CheckForNull String unprofiledRoleArn,
+            String credentialSource) {
+        List<String> keys = inSection ? optionKeysOf(sectionLines) : List.of();
+        return emissionFor(
+                section,
+                inSection,
+                keys.contains(ROLE_ARN),
+                keys.contains(ROLE_SESSION_NAME),
+                unprofiledRoleArn,
+                credentialSource,
+                new LinkedHashSet<>(keys));
+    }
+
     private static Emission emissionFor(
             @CheckForNull String section,
             boolean inSection,
@@ -209,12 +271,12 @@ public final class AwsConfigOverlay {
         if (assumesRole) {
             return Emission.sessionNameOnly();
         }
-        // A profile with no role_arn does not assume anything: it hands the build the agent's base
-        // identity directly, whose session name the platform fixed and nobody can change. That is the
-        // same unattributable path as [default], just reached by name instead of by omission, so it
-        // gets the same treatment. The principal ARN is unchanged — it is the agent's own role — so
-        // permissions, and every resource policy that grants to that role, are unaffected.
-        if (unprofiledRoleArn != null && isProfileSection(section)) {
+        // A profile with no role_arn AND no other source of identity does not assume anything: it hands
+        // the build the agent's base identity directly, whose session name the platform fixed and nobody
+        // can change. That is the same unattributable path as [default], just reached by name instead of
+        // by omission, so it gets the same treatment. The principal ARN is unchanged — it is the agent's
+        // own role — so permissions, and every resource policy that grants to that role, are unaffected.
+        if (unprofiledRoleArn != null && isProfileSection(section) && !establishesIdentity(sectionKeys)) {
             // Only what the section does not already declare. A section such as [profile ops] already
             // carries credential_source; writing it a second time makes the ENTIRE file unparseable to
             // botocore — every profile in it, not just this one — and every AWS call in the build then
@@ -222,6 +284,53 @@ public final class AwsConfigOverlay {
             return Emission.assumeRole(unprofiledRoleArn, credentialSource, sectionKeys);
         }
         return Emission.verbatim();
+    }
+
+    /**
+     * Keys by which a profile establishes an identity <em>other</em> than the agent's base credentials.
+     *
+     * <p>"Declares no {@code role_arn}" is not the same as "uses the agent's base identity". A profile
+     * can resolve credentials through SSO, through another profile, through an external process, through
+     * static keys or through web identity — and in every one of those cases writing the assume-role
+     * triple is wrong, in three distinct ways:
+     *
+     * <ul>
+     *   <li><b>SSO</b> — botocore's assume-role provider takes precedence over the SSO provider, so the
+     *       profile would silently authenticate as the agent's instance role, in the wrong account,
+     *       instead of as the SSO identity the pipeline asked for. It would not fail; it would succeed
+     *       as the wrong principal, which is worse.
+     *   <li><b>{@code source_profile}</b> — botocore raises {@code InvalidConfigError} for a profile
+     *       carrying both {@code source_profile} and {@code credential_source}, so every call using it
+     *       fails outright.
+     *   <li><b>{@code credential_process} / static keys / web identity</b> — the configured identity is
+     *       silently replaced by the node role.
+     * </ul>
+     *
+     * <p>None of these is caught by the duplicate-key guard, because the keys differ. The rule is
+     * therefore the conservative one this plugin applies everywhere else: touch a section only when it
+     * is unambiguous that doing so cannot change who the build is.
+     */
+    private static final Set<String> IDENTITY_KEYS = Set.of(
+            "sso_session",
+            "sso_start_url",
+            "sso_region",
+            "sso_account_id",
+            "sso_role_name",
+            "source_profile",
+            "credential_process",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "web_identity_token_file");
+
+    /** Whether the section already resolves credentials some way other than the agent's base identity. */
+    private static boolean establishesIdentity(Set<String> sectionKeys) {
+        for (String key : sectionKeys) {
+            if (IDENTITY_KEYS.contains(key)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** What to insert into a section: nothing, a session name, or a full assume-role triple. */
@@ -423,22 +532,37 @@ public final class AwsConfigOverlay {
      */
     @NonNull
     private static java.util.Optional<String> duplicateKey(List<String> lines) {
+        // Slice into sections and run the SAME parser the writer used. When these two disagreed about
+        // what counts as a key, the guard was blind to exactly the corruption the writer had produced.
         String section = "";
-        Set<String> keys = new LinkedHashSet<>();
-        for (String line : lines) {
-            Matcher header = SECTION.matcher(line);
-            if (header.matches()) {
-                section = header.group(1).trim();
-                keys = new LinkedHashSet<>();
+        int start = 0;
+        for (int i = 0; i <= lines.size(); i++) {
+            boolean end = i == lines.size();
+            if (!end && !SECTION.matcher(lines.get(i)).matches()) {
                 continue;
             }
-            Matcher assignment = ASSIGNMENT.matcher(line);
-            if (assignment.matches()) {
-                String key = assignment.group(1).toLowerCase(Locale.ROOT);
-                if (!keys.add(key)) {
-                    return java.util.Optional.of("the generated file declares '" + key + "' twice in [" + section
-                            + "], which makes the whole file unparseable");
-                }
+            java.util.Optional<String> defect = firstRepeat(optionKeysOf(lines.subList(start, i)), section);
+            if (defect.isPresent()) {
+                return defect;
+            }
+            if (!end) {
+                section = SECTION.matcher(lines.get(i)).matches()
+                        ? lines.get(i).trim().replaceAll("^\\[|\\]$", "")
+                        : section;
+                start = i;
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /** The first key declared twice in one section, if any. */
+    @NonNull
+    private static java.util.Optional<String> firstRepeat(List<String> keys, String section) {
+        Set<String> seen = new LinkedHashSet<>();
+        for (String key : keys) {
+            if (!seen.add(key)) {
+                return java.util.Optional.of("the generated file declares '" + key + "' twice in [" + section
+                        + "], which makes the whole file unparseable");
             }
         }
         return java.util.Optional.empty();

@@ -23,23 +23,9 @@
     </f:entry>
 
     <f:entry
-        title="Apply on nodes labelled"
-        field="nodeLabelPattern"
-        description="Optional regular expression, matched in full against each of the executing node's labels (and its node name; the built-in node matches 'built-in'). Blank applies on every node. Useful when one agent carries a different AWS configuration, or makes no AWS calls at all.">
-      <f:textbox/>
-    </f:entry>
-
-    <f:entry
-        title="Attribute unprofiled calls as"
-        field="unprofiledRoleArn"
-        description="Optional IAM role ARN. AWS calls that name no profile fall through to the agent's base identity, whose session name is fixed by the platform and cannot be changed — so they cannot be attributed unless a role is assumed on their behalf. Set this and the generated [default] assumes that role under the build's session name. Use the agent's OWN instance role: assuming a different role changes the principal ARN, and bucket, key and repository policies grant access by principal ARN. Blank leaves these calls exactly as they are today.">
-      <f:textbox/>
-    </f:entry>
-
-    <f:entry
         title="Attribute unprofiled calls as the node's OWN instance role"
         field="attributeUnprofiledAsNodeRole"
-        description="Recommended instead of typing an ARN above. Each node is asked for its own instance role over IMDS when a build prepares, so every agent is correct by construction — including agents that do not exist yet. A single typed ARN is only right while every agent shares one instance role; hand a node a role it may not assume and its unprofiled aws calls FAIL rather than merely going unattributed. When this is ticked the ARN above is ignored. If a node reports no instance role, nothing is written and its unprofiled calls are left exactly as they are today. Note this cannot check whether the node's role is PERMITTED to assume itself — verify with: aws iam simulate-principal-policy --policy-source-arn ROLE --action-names sts:AssumeRole --resource-arns ROLE">
+        description="Attributes the AWS calls that name no profile — every bare 'aws' command, and 'aws ecr get-login-password'. These fall through to the agent's base identity, whose session name EC2 fixes to the instance ID, so they are unattributable unless a role is assumed on their behalf. This is roughly 98% of all AWS calls on a typical controller: without it, very little is actually audited. Each node is asked for its own instance role over IMDS when a build prepares, so every agent is correct by construction — including agents that do not exist yet. Self-assume is deliberate: the principal ARN stays identical, so bucket, key and repository policies that grant access by principal ARN keep working, where a different role with the same permissions would be denied by all of them. Fail-safe in two ways: a node that reports no instance role, and a node whose role AWS will not permit to assume itself, are both left exactly as they are today and logged — unattributed, never broken.">
       <f:checkbox/>
     </f:entry>
 
