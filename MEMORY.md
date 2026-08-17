@@ -3402,3 +3402,54 @@ that does not exist gives `Error: Missing base provider configuration for overri
 **Scope:** this solves the **3 provider-`assume_role` jobs**. It does **not** help the 7 jobs that run
 `aws sts assume-role --role-session-name TestSessionName` in shell — proven separately that an
 explicit CLI argument cannot be overridden by env, config, or CLI alias (all three tested).
+
+### Session 25 addendum 7 — TerraformOverride implemented and proven end to end (2.1.4)
+
+`TerraformOverride` generates the `*_override.tf` that names a Terraform provider's own
+`assume_role`. **It is a pure function with no callers in any runtime path** — `grep` across
+`src/main/java` returns only its own file — so it cannot affect a single existing build. That is
+deliberate: the extraction logic is the part worth proving first, and it can be proven without
+touching the contribution path at all.
+
+**End-to-end proof.** The real `_setting.tf` was fed to the compiled class, and the file it produced
+was dropped into a canary replicating the real repo (yaml-driven locals, `terraform.workspace`,
+computed `role_arn`), planning against the real cross-account role:
+
+```
+with the plugin-generated override:
+  275595855473:assumed-role/terraform-assume-role/jk-cln-app-terraform-pipeline-5620
+after removing it (control):
+  275595855473:assumed-role/terraform-assume-role/aws-go-sdk-1786983449497858871
+```
+
+`region` preserved, same role, same account, fully reversible. The generated `role_arn` is copied
+character-for-character:
+`"arn:aws:iam::${local.workspace["aws"]["account_id"]}:role/${local.workspace["aws"]["role"]}"`.
+
+**9 tests, all asserting refusal rather than action** — because the failure mode here is not lost
+attribution, it is a build silently running as a different principal:
+
+| Input | Result |
+|---|---|
+| Real production shape | override written, expression verbatim |
+| `assume_role` without `role_arn` | **nothing written** (this is the dangerous one) |
+| `session_name` already pinned | nothing — a deliberate choice is not ours to change |
+| Aliased provider | nothing — an override without the alias hits the wrong provider |
+| Two `provider "aws"` blocks | nothing — picking one is a guess that could re-point an account |
+| `provider "aws"` inside a comment or string | nothing — not a declaration |
+| Interpolation braces inside strings | handled; block matching is brace-counted, string- and comment-aware |
+
+**Still to build for 2.3.0: the runtime wiring**, which is the genuinely delicate part and was
+deliberately not rushed. Design constraints already known:
+
+1. The plugin prepares at the *first* step, but `.tf` files only exist *after* checkout — so the write
+   must be lazy, not part of `prepareOnce`.
+2. It must be scoped by an explicit job-name pattern and off by default.
+3. The file must be removed at build end; leaving generated files in a workspace is the kind of
+   residue this plugin has avoided everywhere else.
+4. A workspace scan needs bounding (depth, file count, skip `.terraform/`) so it cannot become a
+   per-step cost on large checkouts.
+
+**Scope, unchanged:** solves the 3 provider-`assume_role` jobs. The 7 shell jobs run
+`aws sts assume-role --role-session-name …` explicitly, and an explicit CLI argument was proven
+unbeatable by environment, config, and CLI alias.
