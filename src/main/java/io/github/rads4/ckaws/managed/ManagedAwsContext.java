@@ -277,6 +277,9 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             return null;
         }
 
+        writeTerraformOverrides(
+                run, workspace, node, configuration, variables.get(SESSION_VARIABLE), context.get(TaskListener.class));
+
         // Observe only: everything above ran - the configuration was read, decorated, safety-checked and
         // written, and the console says what would have happened - but nothing is exported. A build in
         // this mode cannot observe the plugin, so it cannot be broken by it. See
@@ -743,6 +746,57 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         }
         NODE_ROLE_ARNS.put(nodeName, resolved);
         return resolved;
+    }
+
+    /**
+     * Names the second hop for jobs opted in to it, if any Terraform configuration is visible yet.
+     *
+     * <p>Called on every step rather than once, because the {@code .tf} files appear only when the job
+     * checks its repository out — long after the first step, where preparation happens. Throttled so
+     * repeated calls cost a timestamp comparison rather than a directory walk.
+     *
+     * <p>Wrapped in its own guard. This is the one thing the plugin does that writes into a job's own
+     * source tree, and no failure of it may ever reach the build: on any problem it contributes nothing
+     * and the job behaves exactly as it does today.
+     */
+    static void writeTerraformOverrides(
+            Run<?, ?> run,
+            FilePath workspace,
+            @CheckForNull Node node,
+            CkAwsGlobalConfiguration configuration,
+            @CheckForNull String sessionName,
+            @CheckForNull TaskListener listener)
+            throws InterruptedException {
+        if (sessionName == null
+                || !configuration.appliesTerraformOverride(run.getParent().getFullName())) {
+            return;
+        }
+        // No throttle. Two canaries proved why: the job deleted and re-created its Terraform directory
+        // between steps, and any interval long enough to be worth having was also long enough to skip
+        // the scan that mattered — the console then claimed a file had been written while the build ran
+        // with an unnamed second hop. This runs only for jobs explicitly opted in by pattern (three of
+        // eight hundred here), and the walk is bounded, so correctness is worth more than the saving.
+        try {
+            // Rescanned for the whole build, never marked "done". A canary proved why: the job deleted
+            // and re-created its Terraform directory between steps, and a one-shot marker meant the
+            // override written before that deletion was never replaced — the build then ran with an
+            // unnamed second hop while the console claimed the file had been written. This is the same
+            // shape as the stale-memo defect: any state cached across a step must survive a workspace
+            // being wiped underneath it. Rewriting identical content is idempotent and cheap.
+            List<String> written = TerraformOverride.applyTo(workspace, sessionName);
+            for (String path : written) {
+                ManagedAwsRecord.record(run, node, new FilePath(workspace.getChannel(), path));
+            }
+            if (!written.isEmpty() && listener != null) {
+                listener.getLogger()
+                        .println("[ck-aws] named the Terraform provider's own assume_role as " + sessionName + " in "
+                                + written.size() + " director" + (written.size() == 1 ? "y" : "ies"));
+            }
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception | LinkageError e) {
+            LOGGER.log(Level.FINE, e, () -> "ck-aws: could not write Terraform overrides");
+        }
     }
 
     private static void warnUnresolvable(@CheckForNull TaskListener listener) {

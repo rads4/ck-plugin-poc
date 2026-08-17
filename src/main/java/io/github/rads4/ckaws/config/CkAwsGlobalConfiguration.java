@@ -92,6 +92,9 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
 
     private volatile boolean attributeUnprofiledAsNodeRole;
 
+    @CheckForNull
+    private volatile String terraformOverridePattern;
+
     private volatile boolean diagnostics;
 
     private volatile boolean observeOnly;
@@ -352,6 +355,7 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         boolean hasInclude = json.has("jobNamePattern");
         boolean hasExclude = json.has("jobNameExcludePattern");
         boolean hasNodeRole = json.has("attributeUnprofiledAsNodeRole");
+        boolean hasTfOverride = json.has("terraformOverridePattern");
         boolean hasDiagnostics = json.has("diagnostics");
         boolean hasObserveOnly = json.has("observeOnly");
         boolean hasCredentialSource = json.has("credentialSource");
@@ -373,6 +377,9 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         if (!hasNodeRole) {
             attributeUnprofiledAsNodeRole = false;
         }
+        if (!hasTfOverride) {
+            terraformOverridePattern = null;
+        }
         if (!hasDiagnostics) {
             diagnostics = false;
         }
@@ -384,6 +391,39 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         }
         save();
         return true;
+    }
+
+    /**
+     * Jobs for which a Terraform provider's own {@code assume_role} should be named. Blank disables it.
+     *
+     * <p>Deliberately a separate, opt-in pattern rather than something that follows the main scope. A
+     * Terraform provider carrying its own {@code assume_role} block performs a second assume that the
+     * generated AWS configuration cannot reach, so those calls carry an SDK-invented name. Naming them
+     * means writing a file into the checked-out workspace, and writing into a job's own source tree is a
+     * bigger intrusion than anything else this plugin does. It should apply to the handful of jobs that
+     * need it and to nothing else.
+     *
+     * <p>An unparseable pattern matches nothing, so a typo disables the feature rather than widening it.
+     */
+    @CheckForNull
+    public String getTerraformOverridePattern() {
+        return terraformOverridePattern;
+    }
+
+    @DataBoundSetter
+    public void setTerraformOverridePattern(@CheckForNull String terraformOverridePattern) {
+        String trimmed = terraformOverridePattern == null ? "" : terraformOverridePattern.trim();
+        this.terraformOverridePattern = trimmed.isEmpty() ? null : trimmed;
+        save();
+    }
+
+    /** Whether the Terraform second-hop override applies to this job. Blank pattern means never. */
+    public boolean appliesTerraformOverride(@CheckForNull String jobFullName) {
+        String pattern = terraformOverridePattern;
+        if (pattern == null || jobFullName == null) {
+            return false;
+        }
+        return matches(pattern, jobFullName, false, false);
     }
 
     /**

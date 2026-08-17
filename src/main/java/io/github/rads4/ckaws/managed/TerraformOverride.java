@@ -40,7 +40,100 @@ final class TerraformOverride {
     /** Written into a Terraform working directory. The {@code _override.tf} suffix is what makes Terraform merge it. */
     static final String FILE_NAME = "zz_ckaws_session_override.tf";
 
+    /**
+     * How deep below the workspace to look. Terraform working directories in these repositories sit at
+     * the root or one or two levels down ({@code common/}, {@code application-setup/kong/}).
+     */
+    private static final int MAX_DEPTH = 4;
+
+    /** Upper bound on directories examined, so a large checkout cannot turn this into a per-step cost. */
+    private static final int MAX_DIRECTORIES = 400;
+
     private TerraformOverride() {}
+
+    /**
+     * Writes an override into every Terraform working directory below {@code workspace} that has an
+     * unnamed second hop, and returns what was written.
+     *
+     * <p>Runs on the agent, because the workspace is the agent's filesystem. Called <em>lazily</em> —
+     * repeatedly, as the build proceeds — rather than once at preparation time, because the {@code .tf}
+     * files do not exist until the job has checked its repository out, which happens well after the
+     * first step. Rewriting an identical file is harmless; not writing it at all would be silent.
+     *
+     * @return the absolute paths written, for the caller to register for cleanup
+     */
+    @NonNull
+    static List<String> applyTo(@NonNull hudson.FilePath workspace, @NonNull String sessionName)
+            throws java.io.IOException, InterruptedException {
+        return workspace.act(new WriteOverrides(sessionName));
+    }
+
+    /** Scans and writes on the node that owns the workspace. */
+    private static final class WriteOverrides extends jenkins.MasterToSlaveFileCallable<List<String>> {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String sessionName;
+
+        WriteOverrides(String sessionName) {
+            this.sessionName = sessionName;
+        }
+
+        @Override
+        public List<String> invoke(java.io.File base, hudson.remoting.VirtualChannel channel) {
+            List<String> written = new ArrayList<>();
+            List<java.io.File> directories = new ArrayList<>();
+            collect(base, 0, directories);
+            for (java.io.File dir : directories) {
+                java.io.File[] tf = dir.listFiles((d, n) -> n.endsWith(".tf") && !n.equals(FILE_NAME));
+                if (tf == null) {
+                    continue;
+                }
+                for (java.io.File file : tf) {
+                    String content;
+                    try {
+                        content = new String(
+                                java.nio.file.Files.readAllBytes(file.toPath()),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                    } catch (java.io.IOException e) {
+                        continue; // unreadable: leave this directory exactly as it is
+                    }
+                    String override = overrideFor(content, sessionName);
+                    if (override == null) {
+                        continue;
+                    }
+                    java.io.File target = new java.io.File(dir, FILE_NAME);
+                    try {
+                        java.nio.file.Files.write(
+                                target.toPath(), override.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        written.add(target.getAbsolutePath());
+                    } catch (java.io.IOException e) {
+                        // A read-only or vanished directory is not worth failing a build over.
+                    }
+                    break; // one provider block per directory is the shape these repositories use
+                }
+            }
+            return written;
+        }
+
+        /** Bounded walk. {@code .terraform/} holds downloaded modules, which are not ours to touch. */
+        private void collect(java.io.File dir, int depth, List<java.io.File> out) {
+            if (depth > MAX_DEPTH || out.size() >= MAX_DIRECTORIES) {
+                return;
+            }
+            out.add(dir);
+            java.io.File[] children = dir.listFiles();
+            if (children == null) {
+                return;
+            }
+            for (java.io.File child : children) {
+                String name = child.getName();
+                if (child.isDirectory() && !name.equals(".terraform") && !name.equals(".git")) {
+                    collect(child, depth + 1, out);
+                }
+            }
+        }
+    }
 
     /**
      * The override file for a provider block, or {@code null} if this file should be left alone.

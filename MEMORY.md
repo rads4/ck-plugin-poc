@@ -3453,3 +3453,46 @@ deliberately not rushed. Design constraints already known:
 **Scope, unchanged:** solves the 3 provider-`assume_role` jobs. The 7 shell jobs run
 `aws sts assume-role --role-session-name …` explicitly, and an explicit CLI argument was proven
 unbeatable by environment, config, and CLI alias.
+
+### Session 25 addendum 8 — Terraform second hop WIRED and validated end to end (2.1.8)
+
+Working on the POC clone. `poc-canary-tfoverride` #4, a Freestyle job on a real agent, planning against
+the real cross-account role:
+
+```
+[ck-aws] named the Terraform provider's own assume_role as jk-poc-canary-tfoverride-4 in 1 directory
+OVERRIDE PRESENT:  session_name = "jk-poc-canary-tfoverride-4"
+who = "arn:aws:sts::275595855473:assumed-role/terraform-assume-role/jk-poc-canary-tfoverride-4"
+```
+
+CloudTrail in 275595855473 confirms `GetCallerIdentity` under that session. **The second hop is now
+attributed.** Full regression: **14/14 canaries pass, 0 fail.**
+
+**Three defects were found by running it, not by reading it.** Each produced a build that looked
+correct — the console said the override had been written — while Terraform still used the invented
+name. That combination, a truthful-looking log over a wrong outcome, is the worst kind, and none of
+the three would have been caught without a canary:
+
+1. **Wired into the Pipeline path only.** The canary was Freestyle, which goes through
+   `ManagedAwsFreestyleEnvironment` and never reached the new code. Both paths now call it. (The real
+   Terraform jobs are Pipeline, so this would have shipped looking fine and silently skipped every
+   Freestyle job.)
+2. **A "done, stop scanning" marker.** The job did `rm -rf` on its Terraform directory between steps,
+   which deleted the override the plugin had already written — and the marker meant it was never
+   replaced. **Exactly the stale-memo defect this plugin fixed in 2.2, in new clothes:** any state
+   cached across a step must survive the workspace being wiped underneath it.
+3. **The throttle itself.** Reduced from 15 s to 2 s, and still too long — these steps run under a
+   second apart, so the scan that mattered was skipped anyway. Removed entirely. The feature runs only
+   for jobs explicitly opted in by pattern (3 of 802) and the walk is bounded, so correctness is worth
+   more than the saving.
+
+**Design as shipped:** opt-in via `terraformOverridePattern`, blank by default, separate from the main
+scope — writing into a job's own source tree is a bigger intrusion than anything else this plugin
+does, so it applies to the handful of jobs that need it and nothing else. Verified isolation:
+`appliesTerraformOverride("poc-canary-tfoverride")` is true and `("dev2/fluentd")` is false. Written
+paths are registered through `ManagedAwsRecord`, so the existing cleanup listener removes them at
+build end. The whole call is inside its own guard: any failure contributes nothing and the job behaves
+exactly as it does today.
+
+**Scope unchanged:** solves the 3 provider-`assume_role` jobs. The 7 shell jobs that pass
+`--role-session-name` explicitly remain unreachable — proven against env, config and CLI alias.
