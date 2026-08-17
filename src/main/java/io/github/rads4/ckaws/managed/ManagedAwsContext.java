@@ -368,8 +368,41 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
         }
         String here = current.getRemote();
         String root = workspace.getRemote();
-        boolean inside = here.equals(root) || here.startsWith(root + "/") || here.startsWith(root + "\\");
-        return inside ? workspace : current;
+        if (here.equals(root) || here.startsWith(root + "/") || here.startsWith(root + "\\")) {
+            return workspace;
+        }
+        // Concurrent builds. getWorkspaceFor always answers ".../job", but a second simultaneous build of
+        // the same job runs in ".../job@2". Without this the path is not "inside" the root, so every
+        // concurrent build fell back to the current directory — reintroducing, for exactly those builds,
+        // the three problems this method exists to prevent: ck-aws/ written into the checked-out source,
+        // one preparation per dir() block, and directories the cleanup cannot reclaim.
+        FilePath concurrent = concurrentRoot(current, here, root);
+        return concurrent != null ? concurrent : current;
+    }
+
+    /**
+     * The {@code job@N} root for a concurrent build, or {@code null} if this path is not one.
+     *
+     * <p>The {@code @} must be followed by digits and then either nothing or a separator, so a job whose
+     * name merely contains {@code @} cannot be mistaken for a concurrent workspace.
+     */
+    @CheckForNull
+    private static FilePath concurrentRoot(FilePath current, String here, String root) {
+        if (!here.startsWith(root + "@")) {
+            return null;
+        }
+        int i = root.length() + 1;
+        int digits = i;
+        while (digits < here.length() && Character.isDigit(here.charAt(digits))) {
+            digits++;
+        }
+        if (digits == i) {
+            return null; // "@" not followed by a number
+        }
+        if (digits < here.length() && here.charAt(digits) != '/' && here.charAt(digits) != '\\') {
+            return null; // "@2x" — not a concurrent-build suffix
+        }
+        return new FilePath(current.getChannel(), here.substring(0, digits));
     }
 
     /**

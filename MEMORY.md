@@ -3191,3 +3191,66 @@ controller JVM; `configure()` blanks `profiles` in place while build threads rea
 `NODE_ROLE_ARNS` never invalidates for a permanent agent re-provisioned under the same node name;
 per-step remote I/O in `stillOnDisk`; `buildWorkspace` does not cover `job@2` concurrent builds;
 failed-assume stderr is echoed unmasked.
+
+### Session 25 addendum 3 — why these issues surfaced now, and what was fixed
+
+**Why now.** Almost none of this was new code going wrong. Three things converged:
+
+1. **This was the first systematic review of the whole repo.** Everything before it was
+   incident-driven (rivon) or milestone-driven, so review attention followed the defect rather than
+   the codebase. `DefaultProcessRunner`, `CkAwsWithProfileStep` and `CliStsAssumeRole` date from M5/M6
+   and had never been read adversarially.
+2. **The blast radius of the config writer grew enormously in 2.2.** Before per-node unprofiled
+   attribution, the plugin added `role_session_name` to profiles that *already* assumed a role — a
+   tiny, almost unfalsifiable edit. Now it writes a full `role_arn` + `credential_source` +
+   `role_session_name` triple into sections. A latent weakness in *parsing* became a
+   build-breaking one in *writing*. The production `DuplicateOptionError` incident was the first
+   symptom; the SSO, `source_profile`, indentation and delimiter defects are the same root cause.
+3. **The root cause is one design decision:** the plugin approximates, with regexes, a file format
+   whose real semantics live in Python's `configparser`. Every defect in this class comes from the
+   approximation diverging from the parser. That is now contained in a single `optionKeysOf(...)`
+   helper — if it diverges again, it diverges in one place, and both the writer and the guard move
+   together.
+
+**Fixed in this pass** (beyond the six already recorded):
+
+- **`buildWorkspace` ignored concurrent builds.** `getWorkspaceFor` always answers `…/job`, but a
+  second simultaneous build runs in `…/job@2`, which is not "inside" that root — so **every concurrent
+  build fell back to the current directory**, reintroducing exactly the three problems the method
+  exists to prevent. Now recognises a `job@N` root (digits, then a separator, so a job whose name
+  contains `@` cannot be mistaken for one).
+- **Session-name collisions.** Keeping the tail distinguishes jobs in the *same* folder but not jobs
+  in *different* folders sharing a trailing segment — both truncated to one identical session name,
+  and CloudTrail then attributes two builds to a single identity. A 6-hex digest of the full original
+  name is appended whenever the name is lossy. Names that fit are untouched, which is nearly all.
+- **`DefaultProcessRunner`**: child now gets no stdin (the default PIPE meant any prompting child
+  blocked forever — and a blocking pipe read ignores `Thread.interrupt()`, so the step could not be
+  aborted and the thread was lost permanently); bounded `waitFor`; both captures capped at 4 MB (this
+  runs in the **controller** JVM, so a runaway child is a controller-wide problem); stderr reader is a
+  daemon, catches `Throwable`, and is interrupted and joined on every exit path.
+- **`profiles` is `volatile` and only ever replaced wholesale.** `configure()` emptied it in place
+  before `bindJSON`, so an admin pressing Save while a build was inside `ckAwsWithProfile` could make
+  that build abort with "No AWS profile named 'prod' is configured" — a phantom failure that would
+  never reproduce. The volatile write also gives readers a happens-before edge to the `AwsProfile`
+  objects, which are populated by setters after construction.
+- **Console corruption**: the masking filter re-encoded *every* line through the build charset, so any
+  byte invalid in it became U+FFFD permanently. Original bytes are now written through untouched when
+  nothing matched.
+- **Unmasked credentials on the failure path**: the masking filter is attached only to the step's
+  *body*, so a failed assume-role echoed raw stderr into the console — and with `AWS_DEBUG` that
+  includes the signed `Authorization` header and the source session token. Now masked and truncated.
+- **`AWS_SESSION_TOKEN=None`**: `--output text` renders a null field as the literal `None`, which is
+  not blank and passed every check; the build proceeded and failed opaquely much later inside the tool
+  that used the credentials. Now rejected at construction.
+- **Blank `awsExecutable` guard** added to `CkAwsWithProfileStep`, matching `CkAwsAssumeRoleStep`.
+
+**232 tests.** Still recorded, not fixed: `NODE_ROLE_ARNS` does not invalidate for a permanent agent
+re-provisioned under the same node name (all templates here are ephemeral, and a restart clears it),
+and `stillOnDisk` does a remote stat per step. Both need a design decision — a `ComputerListener` and
+a throttle respectively — rather than a patch.
+
+**Exposure note worth keeping:** the `DefaultProcessRunner` / `CliStsAssumeRole` /
+`CkAwsWithProfileStep` findings are all in the **M11 explicit-step layer**, which the census showed
+**no production job uses**. They were worth fixing, but none of them gated the install. The findings
+that did matter for the 802 real jobs were the ones in `AwsConfigOverlay`, `ManagedAwsContext`,
+`ManagedAwsFreestyleEnvironment`, `CkAwsGlobalConfiguration` and `SessionName`.

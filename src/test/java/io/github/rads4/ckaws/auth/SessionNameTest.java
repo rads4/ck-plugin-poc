@@ -71,17 +71,39 @@ class SessionNameTest {
 
         assertTrue(first.value().length() <= 64);
         assertTrue(second.value().length() <= 64);
-        assertTrue(first.value().endsWith("authbridge-12"), "the job's own name must survive: " + first.value());
-        assertTrue(second.value().endsWith("rivon-12"), "the job's own name must survive: " + second.value());
+        assertTrue(first.value().contains("authbridge"), "the job's own name must survive: " + first.value());
+        assertTrue(second.value().contains("rivon"), "the job's own name must survive: " + second.value());
+        assertTrue(first.value().endsWith("-12") && second.value().endsWith("-12"), "the build number survives");
         assertNotEquals(first.value(), second.value(), "two jobs in one folder must not share a session name");
+    }
+
+    /**
+     * Keeping the tail is not sufficient on its own. Two jobs in <em>different</em> folders can share
+     * their trailing segment, and truncation then produced one identical session name for both — at
+     * which point CloudTrail attributes both builds to a single identity and the audit trail is wrong
+     * in a way nobody would notice. A digest of the full name is appended whenever the name is lossy.
+     */
+    @Test
+    void jobsWithIdenticalTailsInDifferentFoldersDoNotCollide() {
+        String tail = "/" + repeat("very-long-service-name/", 2) + "deploy-service";
+
+        SessionName a = SessionName.forBuild(repeat("alpha-team/", 3) + tail, 12);
+        SessionName b = SessionName.forBuild(repeat("bravo-team/", 3) + tail, 12);
+
+        assertTrue(a.value().length() <= 64 && b.value().length() <= 64);
+        assertNotEquals(a.value(), b.value(), "identical tails must still yield distinct session names");
     }
 
     @Test
     void jobThatSanitizesToNothingStillYieldsValidJkName() {
-        // All chars disallowed -> empty job segment -> "jk-<build>"
+        // All chars disallowed -> no usable segment -> the digest carries the identity instead, so two
+        // such jobs remain distinguishable rather than both becoming "jk-<build>".
         SessionName name = SessionName.forBuild("///", 12);
-        assertEquals("jk-12", name.value());
+        assertTrue(name.value().startsWith("jk-"), name.value());
+        assertTrue(name.value().endsWith("-12"), name.value());
         assertTrue(STS_CHARSET.matcher(name.value()).matches());
+        assertNotEquals(
+                name.value(), SessionName.forBuild("***", 12).value(), "different unusable names must not collide");
     }
 
     @Test

@@ -31,6 +31,13 @@ public final class AwsCredentials {
     }
 
     private static String requireNonBlank(String value, String field) {
+        // "None" is how `--output text` renders a null field. It is not blank, so it passed every check
+        // and the build carried on with AWS_SESSION_TOKEN=None — then failed opaquely much later, inside
+        // whatever tool actually used the credentials.
+        if ("None".equals(value == null ? null : value.trim())) {
+            throw new IllegalArgumentException(
+                    field + " came back as 'None', which is how the AWS CLI renders a missing value.");
+        }
         if (value == null || value.trim().isEmpty()) {
             throw new IllegalArgumentException(field + " must not be null or blank.");
         }

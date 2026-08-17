@@ -64,7 +64,17 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
     public static final List<String> CREDENTIAL_SOURCES =
             List.of(DEFAULT_CREDENTIAL_SOURCE, "EcsContainer", "Environment");
 
-    private List<AwsProfile> profiles = new ArrayList<>();
+    /**
+     * Volatile, and only ever replaced wholesale — never mutated in place.
+     *
+     * <p>Build threads read this while a request thread may be saving the global configuration. Emptying
+     * the list and refilling it left a window in which a build calling {@code resolve(name)} saw no
+     * profiles at all and aborted with "No AWS profile named 'prod' is configured" — a phantom failure
+     * that would never reproduce. Volatile also gives the reading thread a happens-before edge to the
+     * {@link AwsProfile} objects themselves, whose fields are written by {@code @DataBoundSetter} after
+     * construction; without it a build could observe a profile whose {@code mode} was still null.
+     */
+    private volatile List<AwsProfile> profiles = List.of();
 
     private boolean managedAuthentication;
 
@@ -106,7 +116,9 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
 
     @DataBoundSetter
     public void setProfiles(@CheckForNull List<AwsProfile> profiles) {
-        this.profiles = profiles == null ? new ArrayList<>() : new ArrayList<>(profiles);
+        // One immutable snapshot, published by a single volatile write. Readers see either the old list
+        // or the new one, never a list being rebuilt.
+        this.profiles = profiles == null ? List.of() : List.copyOf(profiles);
         save();
     }
 
@@ -323,7 +335,11 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      */
     @Override
     public boolean configure(StaplerRequest2 req, JSONObject json) throws FormException {
-        profiles = new ArrayList<>();
+        // NOT emptied here. bindJSON calls setProfiles when the form carries profiles, which replaces the
+        // list atomically; when it carries none, setProfiles is never called and clearing beforehand was
+        // the only way the list could be emptied — at the cost of a window in which a concurrent build
+        // saw no profiles. Handled after the bind instead, below.
+        boolean submittedProfiles = json.has("profiles");
         managedAuthentication = false;
         jobNamePattern = null;
         jobNameExcludePattern = null;
@@ -332,6 +348,11 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         observeOnly = false;
         credentialSource = DEFAULT_CREDENTIAL_SOURCE;
         req.bindJSON(this, json);
+        if (!submittedProfiles) {
+            // Every profile was removed from the form: one atomic write, after the bind rather than
+            // before it, so no reader ever observes an empty list that is about to be refilled.
+            this.profiles = List.of();
+        }
         save();
         return true;
     }

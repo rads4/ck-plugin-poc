@@ -295,7 +295,13 @@ public final class CkAwsWithProfileStep extends Step {
         }
 
         private static String awsExecutable() {
-            return SystemProperties.getString(AWS_EXECUTABLE_PROPERTY, DEFAULT_AWS_EXECUTABLE);
+            // Same guard as CkAwsAssumeRoleStep. A property set to the empty string — a JCasC template
+            // rendering an unset variable, say — otherwise reaches CliStsAssumeRole's constructor, which
+            // throws IllegalArgumentException from OUTSIDE the try that converts failures into
+            // AbortException. The user then gets a raw stack trace instead of an actionable message,
+            // after the workspace has already been created.
+            String configured = SystemProperties.getString(AWS_EXECUTABLE_PROPERTY, DEFAULT_AWS_EXECUTABLE);
+            return configured == null || configured.trim().isEmpty() ? DEFAULT_AWS_EXECUTABLE : configured;
         }
 
         /**

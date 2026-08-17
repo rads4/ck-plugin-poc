@@ -79,13 +79,20 @@ final class SecretMaskingConsoleLogFilter extends ConsoleLogFilter implements Se
 
         @Override
         protected void eol(byte[] b, int len) throws IOException {
+            // Decode only to look for secrets; write the ORIGINAL bytes back when none matched.
+            // Round-tripping every line through the build charset replaced any byte invalid in that
+            // charset with U+FFFD — permanently corrupting output from a tool emitting Latin-1 or
+            // Shift-JIS, or a file accidentally cat'd, and only inside the authenticated block.
             String line = new String(b, 0, len, charset);
+            String masked = line;
             for (String secret : secrets) {
-                if (line.contains(secret)) {
-                    line = line.replace(secret, MASK);
-                }
+                masked = masked.replace(secret, MASK);
             }
-            out.write(line.getBytes(charset));
+            if (masked.equals(line)) {
+                out.write(b, 0, len);
+            } else {
+                out.write(masked.getBytes(charset));
+            }
         }
     }
 }

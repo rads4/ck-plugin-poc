@@ -67,17 +67,22 @@ public final class SessionName {
         }
 
         String job = sanitizeJobSegment(jobName);
-        if (job.length() > roomForJob) {
-            // Keep the TAIL, not the head. In a folder hierarchy the leading segments are shared by every
-            // job in that folder while the trailing segment is the job itself, so truncating from the
-            // front discards exactly the part that distinguishes one build from another — and two jobs in
-            // the same deep folder would then collide on an identical session name.
-            job = trimDashes(job.substring(job.length() - roomForJob));
+
+        // Truncating or sanitizing away the job name destroys the very thing the session name exists to
+        // carry, and two different jobs can then produce the SAME name — at which point CloudTrail
+        // attributes both builds to one identity and the audit silently lies. Keeping the tail helps
+        // (leading folder segments are shared; the trailing segment distinguishes) but does not fix it:
+        // "platform/a/deploy-service" and "platform/b/deploy-service" share their tail. So whenever the
+        // name is not carried intact, a short digest OF THE FULL ORIGINAL is appended to restore
+        // uniqueness. Names that fit are untouched, which is the overwhelming majority.
+        if (job.length() > roomForJob || job.isEmpty()) {
+            String digest = shortDigest(jobName);
+            int roomLeft = roomForJob - digest.length() - 1; // -1 for the dash joining head to digest
+            String head = roomLeft <= 0 ? "" : trimDashes(job.substring(Math.max(0, job.length() - roomLeft)));
+            job = head.isEmpty() ? digest : head + "-" + digest;
         }
 
-        // If the job segment sanitized/trimmed away to nothing, drop it entirely: "jk-<build>" still
-        // matches jk-* and stays valid.
-        String value = job.isEmpty() ? PREFIX + buildNumber : PREFIX + job + suffix;
+        String value = PREFIX + job + suffix;
 
         if (!VALID.matcher(value).matches()) {
             throw new SessionNameException("Generated session name is not STS-valid: '" + value + "'.");
@@ -88,6 +93,29 @@ public final class SessionName {
     private static String sanitizeJobSegment(String jobName) {
         String replaced = DISALLOWED.matcher(jobName).replaceAll("-");
         return trimDashes(DASH_RUN.matcher(replaced).replaceAll("-"));
+    }
+
+    /**
+     * Six lowercase hex characters of SHA-256 over the untouched job name.
+     *
+     * <p>Not a security property — purely a collision breaker, so it need only be short and stable. It
+     * is computed from the ORIGINAL name rather than the sanitized one, because two names can sanitize
+     * to the same string ({@code a/b} and {@code a-b}) and would otherwise still collide.
+     */
+    private static String shortDigest(String jobName) {
+        try {
+            byte[] hash = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(jobName.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(6);
+            for (int i = 0; i < 3; i++) {
+                hex.append(String.format("%02x", hash[i]));
+            }
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            // SHA-256 is required of every JVM; if it is genuinely absent, a stable fallback still
+            // distinguishes names better than dropping them.
+            return String.format("%06x", jobName.hashCode() & 0xffffff);
+        }
     }
 
     private static String trimDashes(String s) {

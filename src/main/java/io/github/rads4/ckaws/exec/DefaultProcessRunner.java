@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 /**
  * {@link ProcessRunner} backed by {@link ProcessBuilder}.
@@ -22,9 +23,26 @@ import java.util.Objects;
  *
  * <p>stdout and stderr are captured <em>separately</em> and drained concurrently (stderr on a helper
  * thread) so a process that writes a lot to one stream cannot deadlock by filling a pipe buffer while
- * we block reading the other. There is intentionally no timeout in this milestone.
+ * we block reading the other. Both captures are capped, the child gets no stdin, and the wait is
+ * bounded — this runner executes in the CONTROLLER JVM, so a wedged or runaway child is a
+ * controller-wide problem rather than a build-local one.
  */
 public final class DefaultProcessRunner implements ProcessRunner {
+
+    /** Where the child's stdin comes from: nothing. Windows names the same sink differently. */
+    private static final String NULL_DEVICE =
+            System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).startsWith("windows")
+                    ? "NUL"
+                    : "/dev/null";
+
+    /** Upper bound on a single run. Generous for an STS call; short enough that a wedge is not forever. */
+    private static final long TIMEOUT_SECONDS = 120;
+
+    /** How long to wait for the stderr reader once the child is done or killed. */
+    private static final long JOIN_MILLIS = 5_000;
+
+    /** Cap on captured output, per stream. Orders of magnitude above any real assume-role response. */
+    private static final int MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
     @Override
     public ProcessResult run(List<String> command) {
@@ -50,6 +68,13 @@ public final class DefaultProcessRunner implements ProcessRunner {
         }
 
         ProcessBuilder builder = new ProcessBuilder(command);
+        // Give the child no stdin. ProcessBuilder's default is a PIPE that nothing ever writes to or
+        // closes, so any child that reads stdin blocks forever and the stdout read below never returns.
+        // That is not merely a hang: a blocking pipe read does not respond to Thread.interrupt(), so the
+        // step cannot be aborted and the thread is consumed permanently. Reachable in practice whenever
+        // ambient AWS configuration makes the CLI prompt — an mfa_serial on a source profile,
+        // cli_auto_prompt, or an `aws` wrapper script.
+        builder.redirectInput(ProcessBuilder.Redirect.from(new java.io.File(NULL_DEVICE)));
         Map<String, String> childEnvironment = builder.environment();
         for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
             if (override.getValue() == null) {
@@ -66,55 +91,88 @@ public final class DefaultProcessRunner implements ProcessRunner {
             throw new ProcessExecutionException("Failed to start process: " + command, e);
         }
 
-        // Drain stderr on a helper thread while we read stdout on this thread.
+        // Drain stderr on a helper thread while we read stdout on this thread. Daemon, so a stuck reader
+        // can never keep the JVM alive; this runs in the controller JVM, where a leaked non-daemon thread
+        // holding a file descriptor is a controller-wide problem rather than a build-local one.
         String[] stderrHolder = new String[1];
-        IOException[] stderrFailure = new IOException[1];
+        Throwable[] stderrFailure = new Throwable[1];
         Thread stderrReader = new Thread(
                 () -> {
                     try {
-                        stderrHolder[0] = readFully(process.getErrorStream());
-                    } catch (IOException e) {
-                        stderrFailure[0] = e;
+                        stderrHolder[0] = readCapped(process.getErrorStream());
+                    } catch (Throwable t) {
+                        // Throwable, not IOException: readCapped can raise OutOfMemoryError, and letting
+                        // that escape left BOTH holders null, so the caller reported a confusing NPE from
+                        // the result constructor while the real failure was never surfaced.
+                        stderrFailure[0] = t;
                     }
                 },
                 "ck-aws-stderr-reader");
+        stderrReader.setDaemon(true);
         stderrReader.start();
 
-        String stdout;
         try {
-            stdout = readFully(process.getInputStream());
-        } catch (IOException e) {
-            process.destroyForcibly();
-            throw new ProcessExecutionException("Failed reading stdout of process: " + command, e);
-        }
+            String stdout;
+            try {
+                stdout = readCapped(process.getInputStream());
+            } catch (Throwable t) {
+                throw new ProcessExecutionException("Failed reading stdout of process: " + command, t);
+            }
 
-        try {
-            stderrReader.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            process.destroyForcibly();
-            throw new ProcessExecutionException("Interrupted while reading stderr of process: " + command, e);
-        }
-        if (stderrFailure[0] != null) {
-            process.destroyForcibly();
-            throw new ProcessExecutionException("Failed reading stderr of process: " + command, stderrFailure[0]);
-        }
+            int exitCode;
+            try {
+                // Bounded, unlike waitFor(). An unbounded wait here is how a wedged child becomes a
+                // permanently occupied thread.
+                if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    throw new ProcessExecutionException(
+                            "Process did not finish within " + TIMEOUT_SECONDS + "s: " + command);
+                }
+                exitCode = process.exitValue();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ProcessExecutionException("Interrupted while waiting for process: " + command, e);
+            }
 
-        int exitCode;
-        try {
-            exitCode = process.waitFor();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            joinQuietly(stderrReader);
+            if (stderrFailure[0] != null) {
+                throw new ProcessExecutionException("Failed reading stderr of process: " + command, stderrFailure[0]);
+            }
+            return new ProcessResult(command, exitCode, stdout, stderrHolder[0] == null ? "" : stderrHolder[0]);
+        } catch (RuntimeException | Error e) {
+            // One exit path for every failure. Previously several of them threw without stopping the
+            // child or the reader, leaving a thread blocked on a stream of a process nobody would reap.
             process.destroyForcibly();
-            throw new ProcessExecutionException("Interrupted while waiting for process: " + command, e);
+            stderrReader.interrupt();
+            joinQuietly(stderrReader);
+            throw e;
         }
-
-        return new ProcessResult(command, exitCode, stdout, stderrHolder[0]);
     }
 
-    private static String readFully(InputStream in) throws IOException {
+    private static void joinQuietly(Thread thread) {
+        try {
+            thread.join(JOIN_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Reads a stream, refusing to grow without bound.
+     *
+     * <p>{@code readAllBytes()} has no cap, and this runner executes in the <b>controller</b> JVM: a
+     * runaway child that writes gigabytes takes the whole controller down rather than one build. The cap
+     * is far above any legitimate {@code sts assume-role} response, so truncation means something has
+     * already gone wrong.
+     */
+    private static String readCapped(InputStream in) throws IOException {
         try (in) {
-            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            byte[] buffer = new byte[8192];
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            int read;
+            while (out.size() < MAX_OUTPUT_BYTES && (read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, Math.min(read, MAX_OUTPUT_BYTES - out.size()));
+            }
+            return out.toString(StandardCharsets.UTF_8);
         }
     }
 }
