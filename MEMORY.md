@@ -3496,3 +3496,45 @@ exactly as it does today.
 
 **Scope unchanged:** solves the 3 provider-`assume_role` jobs. The 7 shell jobs that pass
 `--role-session-name` explicitly remain unreachable — proven against env, config and CLI alias.
+
+### Session 25 addendum 9 — the two remaining gaps closed (Pipeline path, multi-directory scan)
+
+Two gaps were named and then closed rather than waved at as "needs more mileage".
+
+**Gap 1 — the Pipeline path had no end-to-end proof.** The first canary was Freestyle, but all three
+target jobs are Pipeline; the path that actually matters had never been run. Closed by
+`poc-canary-tfoverride-pipeline`, a declarative Pipeline on a real agent.
+
+**Gap 2 — the scanner had never walked a realistic tree.** The first canary had one directory with one
+`.tf`. Closed with two working directories plus a vendored module planted inside
+`.terraform/modules/vendored/` carrying a provider block pointing at
+`arn:aws:iam::999999999999:role/must-not-be-touched`.
+
+`poc-canary-tfoverride-pipeline` #1, SUCCESS:
+
+```
+[ck-aws] named the Terraform provider's own assume_role as jk-poc-canary-tfoverride-pipeline-1 in 2 directories
+tfa/zz_ckaws_session_override.tf
+tfb/zz_ckaws_session_override.tf
+VENDORED-UNTOUCHED-GOOD
+=== tfa ===  who = ".../terraform-assume-role/jk-poc-canary-tfoverride-pipeline-1"
+=== tfb ===  who = ".../terraform-assume-role/jk-poc-canary-tfoverride-pipeline-1"
+```
+
+Both directories named, **both plans attributed**, and the vendored module inside `.terraform/`
+correctly skipped — the decoy role was never written to. Scope isolation re-verified with a wildcard
+pattern: `poc-canary-tfoverride.*` matches the canaries and **not**
+`cln-infra-terraform-pipelines/cln-app-terraform-pipeline`.
+
+**Confirmed from a real run:** `cln-app-terraform-pipeline` #5621 plans with
+`find . -type d -name .terraform -prune -execdir terraform plan`, i.e. it really does plan in several
+directories at once — so multi-directory support was a genuine requirement, not a hypothetical.
+
+**Also confirmed: the real job gates apply behind a human `input`** ("Click proceed to approve all
+Terraform Plans"), so a plan run cannot become an apply without someone clicking. That is worth
+knowing before anyone runs one again.
+
+**Operational note, cost of the day's iterations:** each plugin restart reset the controller's
+`numExecutors` to 0, which silently left a real queued build waiting forever with
+"Waiting for next available executor on 'Built-In Node'". Restore executors after any restart, or
+queued work stalls with no error anywhere.
