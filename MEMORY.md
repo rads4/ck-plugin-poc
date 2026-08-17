@@ -3538,3 +3538,34 @@ knowing before anyone runs one again.
 `numExecutors` to 0, which silently left a real queued build waiting forever with
 "Waiting for next available executor on 'Built-In Node'". Restore executors after any restart, or
 queued work stalls with no error anywhere.
+
+### Session 25 addendum 10 — the override logic run against 962 REAL .tf files
+
+The compiled `TerraformOverride` was pushed to the clone and run against every `.tf` on the controller
+carrying a top-level `provider "aws"` declaration — real repositories, not fixtures:
+
+```
+TOTAL FILES : 962
+WOULD WRITE : 3
+WOULD SKIP  : 959
+   26  aliased provider
+   13  no assume_role
+  920  other (multi-provider / no role_arn / not a declaration)
+
+sample writes:
+  infra-cloudkeeper-app-services/application-setup/kong/_setting.tf
+  infra-cloudkeeper-app-services/common/_setting.tf
+  test/infra-cloudkeeper-app-services/common/_setting.tf
+```
+
+**Three writes out of 962** — and all three are exactly the `_setting.tf` shape the feature targets.
+The other 959 are left untouched, which is the property that matters: this writes into a job's own
+source tree, so being wrong in the permissive direction is the expensive kind of wrong. Combined with
+the vendored-module canary (a provider block planted under `.terraform/modules/` pointing at
+`role/must-not-be-touched`, confirmed untouched), the scanner is demonstrably conservative on real
+input rather than only on fixtures.
+
+Method note for repeating this: the box runs **Java 17**, so a driver compiled on a newer JDK fails
+with `UnsupportedClassVersionError` — use `javac --release 17`. Loading `TerraformOverride` also needs
+`jenkins-core` and `remoting` on the classpath, both present under
+`/var/cache/jenkins/war/WEB-INF/lib/`, because of its `FileCallable` inner class.
