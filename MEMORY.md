@@ -3894,7 +3894,7 @@ what is merely unused when removing it touches the safety-critical writer.** The
 `TerraformOverride` went because they could break builds. This stays. Scheduled as its own cleanup
 release, with its own review cycle.
 
-**Release artifact: `sha256 19db49ccde34b1a1fb0d4d1fd878df24c8d0f64c39aff6422af88d24932552a3`,
+**Release artifact: `sha256 f2d3a59eb808ccf4ffb0a9166f21eef43edf9d95b0b6b6ce72691ec46dbbbaa6`,
 Plugin-Version 2.2.0, 237 tests, 14/14 canaries.**
 
 ---
@@ -3907,7 +3907,7 @@ Plugin-Version 2.2.0, 237 tests, 14/14 canaries.**
 
 ```
 Plugin-Version : 2.2.0
-sha256         : 98fb48b2e2dc11c53c21a758dd9515f19c92c74f8fe790a736f8bde021698509
+sha256         : f2d3a59eb808ccf4ffb0a9166f21eef43edf9d95b0b6b6ce72691ec46dbbbaa6
 artifact       : poc-jenkins-setup/artifacts/ck-aws-2.2.0-final.hpi
 tests          : 239, 0 failures, 1 skipped
 canaries       : 14/14 on the release build
@@ -4022,3 +4022,26 @@ matching form field), and a doc nit — the `credentialSource` help text says it
 fresh install (empty list), inaccurate on an upgrade carrying profiles.
 
 **Final: 239 tests, 0 failures, 14/14 canaries on the shipping artifact.**
+
+## Final artifact — traceability corrected
+
+A last check caught that the artifact's manifest recorded `Implementation-Build: 6a5323b` while HEAD
+was `1bf157e`: it had been built *before* the review fixes were committed, so anyone checking out the
+recorded commit would not have got this artifact's source. Cosmetic to the running plugin, but it
+defeats the one thing this whole exercise cared about — knowing exactly what is installed.
+
+Rebuilt from the committed tree and re-validated. **Install this and nothing else:**
+
+```
+Plugin-Version      : 2.2.0
+Implementation-Build: 1bf157ee74259afe5ff28734c401357fcfa91d06   (matches HEAD)
+sha256              : f2d3a59eb808ccf4ffb0a9166f21eef43edf9d95b0b6b6ce72691ec46dbbbaa6
+artifact            : poc-jenkins-setup/artifacts/ck-aws-2.2.0-final.hpi
+tests               : 239, 0 failures
+canaries            : 14/14 on this exact artifact
+```
+
+Every earlier 2.2.0 hash (`40f24324`, `19db49cc`, `98fb48b2`) is superseded — same version number,
+different builds during the day. **Check `Implementation-Build` matches the commit you expect before
+installing**; `.hpi` builds are not reproducible, so the sha alone cannot tell you which source it came
+from.

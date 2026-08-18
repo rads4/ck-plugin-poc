@@ -41,7 +41,7 @@ project.**
 | v2.1 — Freestyle coverage, trailing-blank fix, no-role profiles | Implemented, 201 tests — **this is what is installed on CK production** |
 | **v2.2 — context shadowing, workspace anchoring, stale memo, parallel race, observe-only, additions-only environment invariant, per-node unprofiled attribution** | Implemented, 220 tests, `ck-aws 2.2` (`sha256 f5150ba3…`). Installed and validated on the POC clone. Superseded by 2.3 |
 | v2.3 — static unprofiled ARN removed from the form | Implemented. **Installed on the POC clone, so the number is spent** |
-| **v2.2.0 — THE INFRA RELEASE** | **237 tests, five adversarial review passes, 14/14 canaries. `sha256 19db49cc…`** |
+| **v2.2.0 — THE INFRA RELEASE** | **237 tests, five adversarial review passes, 14/14 canaries. `sha256 f2d3a59e…`** |
 
 **Versioning: `major.minor.patch`, and versions track INSTALLATIONS, not builds.**
 
