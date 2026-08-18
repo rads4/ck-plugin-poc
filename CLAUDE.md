@@ -288,8 +288,19 @@ Two clean options, both the operator's call: restart and accept all three, or re
 `role-strategy.bak` and `commons-lang3-api.bak` over their `.jpi` first so the restart carries
 only ck-aws. The second buys unambiguous attribution at the cost of one extra write.
 
-Not caused by the upload — they would have activated at the next boot regardless. We inherit
-them only because we are the reason a restart is being scheduled.
+**Provenance, from the Jenkins log — not inferred:**
+
+```
+17 Aug 05:53:20  Adding dependent install of commons-lang3-api for plugin role-strategy
+17 Aug 05:53:20  Starting the installation of commons-lang3-api on behalf of randeep.arora@cloudkeeper.com
+17 Aug 05:53:20  Starting the installation of role-strategy    on behalf of randeep.arora@cloudkeeper.com
+```
+
+So `role-strategy` was a deliberate single action by Randeep Arora, `commons-lang3-api` came
+with it as a dependency, and those were the only two plugins touched that day. Not caused by
+the ck-aws upload — they would have activated at the next boot regardless. We inherit them only
+because we are the reason a restart is being scheduled, so **tell Randeep before restarting**:
+their change goes live at the same moment as ours.
 
 ### 5. `numExecutors` — a POC artefact, NOT an infra concern
 
