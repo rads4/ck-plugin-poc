@@ -3659,3 +3659,35 @@ with `terraformOverridePattern` blank and enabling it only if either job is revi
 **Method note:** always check *last-run dates* before sizing an attribution gap. A grep over job
 configs counts jobs that exist; it says nothing about jobs anyone runs. Sizing this by config count
 produced "10 jobs" and three sessions of concern; sizing it by activity produced "one job, one line".
+
+### Session 25 addendum 13 — the one live gap, measured exactly
+
+`qa-virtuoso-resource-creation` could not be run directly (it does `ec2 allocate-address` and
+`create-volume`), so its shape was replicated in `poc-canary-explicit-assume`: a normal call, then an
+explicit `aws sts assume-role --role-session-name jenkins-session`, then exporting the returned
+credentials as `AWS_ACCESS_KEY_ID`/`SECRET`/`SESSION_TOKEN`, then another call.
+
+```
+STEP 1  before the explicit assume : .../jk-poc-canary-explicit-assume-1   ATTRIBUTED
+STEP 4  after exporting credentials: .../jenkins-session                   NOT attributed
+Finished: SUCCESS                                                          build unaffected
+```
+
+CloudTrail under `jk-poc-canary-explicit-assume-1`: `AssumeRole` plus two `GetCallerIdentity`. **The
+AssumeRole that minted `jenkins-session` is itself recorded under the build's session name**, so the
+later calls are one join from the build rather than invisible.
+
+**The precise boundary, for this and any job of this shape:**
+
+| Phase | Attributed? |
+|---|---|
+| Everything before the explicit assume | ✅ `jk-<job>-<build>` |
+| The `AssumeRole` call itself | ✅ caller recorded as `jk-<job>-<build>` |
+| Everything after the credentials are exported | ❌ carries the hardcoded name; traceable by join |
+
+Exporting `AWS_ACCESS_KEY_ID` into the environment takes precedence over `AWS_CONFIG_FILE` in every
+AWS SDK, so the plugin is out of the loop by construction — not by defect. **No mechanism inside a
+Jenkins plugin can change this**, which is why the fix is one line in that job's repository.
+
+**Nothing failed.** The canary succeeded, which is the property that matters most: a job of this shape
+is unaffected by the plugin.
