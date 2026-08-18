@@ -102,15 +102,6 @@ public final class ManagedAwsFreestyleEnvironment extends EnvironmentContributor
         Map<String, String> variables =
                 ManagedAwsContext.prepareOnce(build, workspace, node, computer, configuration, listener);
 
-        // Terraform second hop, for jobs opted in to it. Called from BOTH paths deliberately: this method
-        // runs each time a Freestyle build computes its environment — which is once per build step — so
-        // it has the same "look again after the checkout step" property the Pipeline path relies on.
-        // Wiring only Pipeline left Freestyle silently unnamed, which a canary caught.
-        if (variables != null) {
-            ManagedAwsContext.writeTerraformOverrides(
-                    build, workspace, node, configuration, variables.get(ManagedAwsContext.SESSION_VARIABLE), listener);
-        }
-
         // Observe only: prepared and reported, deliberately not exported. Identical to the Pipeline path
         // so the two modes cannot mean different things on different job types.
         return configuration.isObserveOnly() ? null : variables;

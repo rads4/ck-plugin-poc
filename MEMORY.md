@@ -3805,3 +3805,30 @@ ships blank.
 `terraform fmt -check` fails on the generated file (alignment); the writer half (`applyTo`,
 `WriteOverrides`) has no tests; the walk follows symlinks; observe-only does not suppress the write;
 and any admin Save silently clears the pattern because it is in no jelly.
+
+### Session 25 addendum 16 — TerraformOverride removed from the release
+
+The feature is **gone from the shipped plugin**. It was correct research and it worked, but it did not
+belong in an artifact going to a controller running 802 production jobs:
+
+- **Nobody needed it.** Its only two beneficiaries, `ck-analytics-app-services-terraform` and
+  `ck-ecs-terraform`, last ran in **April 2023**. The Terraform job that actually runs is already fully
+  attributed without it.
+- **It carried two build-breaking defects** (multi-line `role_arn` → malformed HCL; sibling attributes
+  such as `external_id` / `policy_arns` silently dropped because Terraform replaces the nested block).
+- **It was the largest unvalidated surface in the release** — canaries only, and its writer half had no
+  tests at all, while writing into a job's own checked-out source tree.
+
+Removed: `TerraformOverride.java`, both call sites, `terraformOverridePattern` and all its config
+plumbing, and the two test classes. `grep` across `src/` returns nothing, and the running plugin
+confirms it: `java.lang.ClassNotFoundException: io.github.rads4.ckaws.managed.TerraformOverride`.
+
+**Nothing durable was lost.** The mechanism, the end-to-end proof, and the trap that omitting
+`role_arn` silently runs as the wrong principal are all in addenda 6–11; the code is in git at
+`ef6a0e0`, `3f511e5`, `b3388b4`. If either job is revived it is one `git show` away, with the two
+defects already identified and the fix written down: copy the whole `assume_role` body verbatim and
+append `session_name`.
+
+**Final artifact: `sha256 40f24324eb6240cb96ce95ddb4cfa109b68ca4a6de0d8f0cdb1a8d7e76dbea54`,
+Plugin-Version 2.2.0, 237 tests, 0 failures.** Installed on the clone; **14/14 canaries pass**. The UI
+is unchanged at eight fields.
