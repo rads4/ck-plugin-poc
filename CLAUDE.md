@@ -114,6 +114,23 @@ committed, and only a manifest check caught it. Releases need
 `mvn -Dchangelist= clean verify` — a plain `mvn verify` yields `2.2.0-SNAPSHOT (private-…)`,
 deliberately not installable.
 
+**Precedent — what is on infra right now cannot be identified.** `plugins/ck-aws.jpi` says
+version 2.1 and `plugins/ck-aws.bak` says 2.0, and *both* record
+`Implementation-Build 2288bd59` — a docs commit from 05 Aug 12:24. The next commit after it is
+`1e60d07`, "v2.1 — Freestyle coverage, unprofiled attribution", made 08 Aug at **21:50**. The
+2.1 artifact was built at 16:23 that day, five hours earlier. So it was built from a working
+tree carrying three days of uncommitted work, and the hash it recorded — honestly — is the last
+commit, which is all `Implementation-Build` can see.
+
+The version numbers were no help either: `<revision>` in `pom.xml` read `1.0` at that commit and
+never carried 2.0 or 2.1 at all. Both labels were passed as `-Drevision=` on the command line.
+
+Two consequences. The rule: **commit first, build second, and check the manifest against the
+commit you meant to ship** — a stamped hash proves nothing about uncommitted edits. And the
+reassurance: replacing an unidentifiable binary with `1bf157e`, whose version *is* committed
+(`bcdbdd5`) and whose manifest was verified against HEAD, is a strict improvement in
+traceability regardless of what else the upgrade does.
+
 **Evidence behind this binary:** 239 unit tests, five adversarial review passes, 14/14
 canaries re-run on this artifact after the rebuild, and real jobs of every type (see the
 coverage table in MEMORY.md). `poc-jenkins-2` is running it now.
