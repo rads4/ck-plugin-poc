@@ -87,74 +87,111 @@ making "the controller says 2.0" meaningless — but the fix is to pin the numbe
 
 # ⚠️ PRE-INSTALL CHECKLIST — read before touching infra Jenkins
 
-Infra Jenkins is installed to **exactly once**. Work through this first; every item
-below is something that was learned the hard way, not a precaution.
+Infra Jenkins is installed to **exactly once**. Rewritten 2026-08-18 after the release was
+cut; every item below is something that was learned the hard way, not a precaution.
 
-### 1. Install the binary that was actually tested — do not rebuild
+### 1. Install this exact binary — do not rebuild it
 
-`.hpi` jars embed build timestamps, so **`mvn clean verify` on unchanged source
-produces a different `sha256` every time.** Build releases with
-`mvn -Dchangelist= clean verify`, or the manifest says `2.3-SNAPSHOT (private-…)`.
+```
+file    : /home/radhika/workspace/poc-jenkins-setup/artifacts/ck-aws-2.2.0-final.hpi
+version : 2.2.0
+build   : 1bf157ee74259afe5ff28734c401357fcfa91d06
+sha256  : f2d3a59eb808ccf4ffb0a9166f21eef43edf9d95b0b6b6ce72691ec46dbbbaa6
+```
 
-**There is no current release artifact.** Development builds are `2.2.0-SNAPSHOT` and are not
-installable by design. Build the release only when you install it, with
-`mvn -Dchangelist= clean verify`, and record its sha256 here at that moment.
+`.hpi` jars embed build timestamps, so **`mvn clean verify` on unchanged source produces a
+different `sha256` every time**, and a rebuild is therefore a *different artifact* that
+nothing has been run against. Three earlier 2.2.0 builds exist in `artifacts/` carrying the
+same version number and different content, so verify the manifest, not the filename:
 
-`poc-jenkins-2` currently runs **2.3** (`bc4d59e1…`) at
-`/var/lib/jenkins/plugins/ck-aws.jpi` — note `.jpi`, Jenkins renames what it installs.
-That build predates the six code-review fixes, so **the clone is not running current code**.
+```
+unzip -p <file>.hpi META-INF/MANIFEST.MF | grep -iE '^Plugin-Version|^Implementation-Build'
+```
 
-The form changes (two entries removed) carry no behaviour change, but the six code-review
-fixes that followed them do — and none of it has been re-validated against a real job. The 2.2 binary that *was* (`f5150ba3…`,
-every canary, all 7 agent types, `dev2/fluentd #119`) is preserved on the instance at
-`/var/lib/poc-artifacts/ck-aws-2.2-VALIDATED-f5150ba3.jpi`. **Keep that until 2.3 has
-its own real-job evidence**, and retrieve it before the instance is terminated.
-Never run `mvn clean` while a validated artifact is the only copy.
+`Implementation-Build` must read `1bf157e…` and must match the commit you believe you are
+shipping. It did not, once: the artifact was built before the last review fixes were
+committed, and only a manifest check caught it. Releases need
+`mvn -Dchangelist= clean verify` — a plain `mvn verify` yields `2.2.0-SNAPSHOT (private-…)`,
+deliberately not installable.
 
-### 2. Settings to apply at install time
+**Evidence behind this binary:** 239 unit tests, five adversarial review passes, 14/14
+canaries re-run on this artifact after the rebuild, and real jobs of every type (see the
+coverage table in MEMORY.md). `poc-jenkins-2` is running it now.
 
-Eight fields. If you see *Attribute unprofiled calls as* (a text box) or *Apply on nodes
-labelled*, you are running an older build.
+### 2. Read infra's existing config XML BEFORE the restart
+
+```
+$JENKINS_HOME/io.github.rads4.ckaws.config.CkAwsGlobalConfiguration.xml
+```
+
+Infra runs 2.1, and its settings survive the upgrade. Two elements decide what happens the
+moment Jenkins comes back:
+
+- `<managedAuthentication>` — memory records this as **off** on infra, which makes the
+  upgrade completely inert. **Confirm it rather than trusting the record**: if it is `true`,
+  the plugin goes live at whatever `<jobNamePattern>` that file names, on restart, with no
+  further action.
+- `<observeOnly>` — **2.1 has no such element** (it was introduced in `59fc321`, after 2.1).
+  An absent element leaves the field initialiser intact, so infra lands on the new default
+  `true`. Pinned by `UpgradeFromOlderVersionTest`. So even the `managedAuthentication = true`
+  case comes up in observe-only, which exports nothing to any build.
+
+### 3. Settings to apply at install time
+
+**Seven fields.** If you see *AWS profiles* or *Apply on nodes labelled*, or a text box under
+*Attribute unprofiled calls as*, you are looking at an older build.
 
 | Field | Value | Why |
 |---|---|---|
-| *Managed authentication* | **off** (the default) | Install and restart with it off; turn on afterwards without a restart. **Observe-only does nothing until this is on** — the master switch is checked first on both the Pipeline and Freestyle paths |
+| *Managed authentication* | **off** (the default) | Install and restart with it off; turn on afterwards with no restart. **Observe-only does nothing until this is on** — the master switch is checked first on both the Pipeline and Freestyle paths |
 | *Apply to jobs matching* | blank | Observe-only makes full scope safe |
 | *Except jobs matching* | blank | Reserved as the incident switch |
-| *Attribute unprofiled calls as the node's own instance role* | **ticked** | This is what audits ~98% |
-| *Observe only* | **ticked — now the shipped default** | So that the moment someone turns the master switch on, the safe mode is already selected rather than every in-scope build changing at once. Enforcing is then a second, deliberate click |
+| *Attribute unprofiled calls as the node's own instance role* | **ticked** | This is what audits ~98% of calls |
+| *Agent base identity* | `Ec2InstanceMetadata` | Infra's agents are EC2 |
+| *Observe only* | **ticked — the shipped default** | So the moment someone turns the master switch on, the safe mode is already selected rather than every in-scope build changing at once. Enforcing is then a second, deliberate click |
 | *Diagnostics* | ticked | Turn off once the rollout is settled |
 
-### 3. Rollout order
+### 4. Rollout order, and the one restart
 
-Install with the switch **off** → restart (the one restart) → switch **on** with
+Install with the master switch **off** → restart (the only restart) → switch **on** with
 observe-only → read a day of console evidence → untick observe-only.
 
-### 4. `numExecutors` — a POC artefact, NOT an infra concern
+The restart is the only irreversible-feeling step and the only one that touches running work:
+it interrupts in-flight builds and disconnects agents. Everything after it is a checkbox.
 
-Executors reset to 0 on every restart **of the clone**, which stalled a real queued build during
-testing. The cause is POC-only: `init.groovy.d/pocInit06KillResumedBuilds.groovy` calls
-`setNumExecutors(0)` on every start, to stop resumed production builds running on a clone. Infra has
-no `pocInit*` hooks — they were pushed onto the clone after it was built, never part of the AMI. **Do
-not carry this step into the infra runbook.**
+**Rollback:** put the 2.1 `.jpi` back and restart. Back up both files first —
+`plugins/ck-aws.jpi` and the config XML above. Once running, rollback is usually cheaper than
+that: unticking *Managed authentication* takes effect without a restart.
 
-### 5. Accept these three known limits before starting
+### 5. `numExecutors` — a POC artefact, NOT an infra concern
 
-- **3 of 802 jobs** (`cln-app-terraform-pipeline`, `ck-analytics-app-services-terraform`,
-  `ck-ecs-terraform`) have provider-level `assume_role`; their post-hop calls carry
-  `aws-go-sdk-<nanotime>` and are traceable only transitively today. **A fix is proven** — a
-  Terraform `*_override.tf` written at build time, no repo change; see MEMORY.md addendum 6.
+Executors reset to 0 on every restart **of the clone**, which stalled a real queued build
+during testing. The cause is POC-only: `init.groovy.d/pocInit06KillResumedBuilds.groovy` calls
+`setNumExecutors(0)` on every start, to stop resumed production builds running on a clone.
+Infra has no `pocInit*` hooks — they were pushed onto the clone after it was built, never part
+of the AMI. **Do not carry this step into the infra runbook.**
+
+### 6. Accept these two known limits before starting
+
+- **`qa-virtuoso-resource-creation`** (daily) assumes a role explicitly and exports the
+  credentials as environment variables, which outrank `AWS_CONFIG_FILE` in every AWS SDK.
+  Calls before the assume are attributed and the `AssumeRole` itself is attributed; calls
+  after it are not, though they stay one join away. One line in that repo fixes it; no plugin
+  can. This is the only live gap — everything else once listed is disabled, dormant 1100+
+  days, or has never run.
+- **Terraform's provider-level `assume_role`** (3 of 802 jobs) makes a second hop whose calls
+  carry `aws-go-sdk-<nanotime>`. Those calls *are* audited — the first hop is `jk-`, so the
+  chain is traceable — they are just not labelled with the build. A `*_override.tf` fix was
+  built and then **deliberately removed** before release: it was wired into the Pipeline path
+  only, it could not replace an override deleted mid-build, and it was not worth the surface
+  for a labelling improvement. Do not reintroduce it without reading MEMORY.md addendum 6.
 - A node whose role AWS will not let self-assume stays **unattributed but working**.
-- **Two job types were never run under 2.2**: a Freestyle job that really calls AWS, and
-  an inline Pipeline that really calls AWS. Both code paths are test-locked and the
-  Freestyle path is additive (it cannot shadow), but neither has live evidence.
 
-### 5. Set up gap detection after the install
+### 7. Set up gap detection after the install
 
-Log recorder on `io.github.rads4.ckaws` at WARNING, plus the CloudTrail session-name
-buckets. See *Detecting unaudited calls automatically* below. Deferred by decision, but
-without it nothing reports centrally.
-
+Log recorder on `io.github.rads4.ckaws` at WARNING, plus the CloudTrail session-name buckets.
+See *Detecting unaudited calls automatically* below. Deferred by decision, but without it
+nothing reports centrally.
 ---
 
 # v2.0 (2026-08-07)

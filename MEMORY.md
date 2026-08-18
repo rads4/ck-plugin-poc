@@ -9,10 +9,10 @@
 | | |
 |---|---|
 | **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is audited today. Infra has never been restarted, reconfigured or installed to during this work |
-| **THE INFRA RELEASE** | **2.2.0** — 249 tests, four adversarial review passes. The 2.1.x line (2.1.1–2.1.8) was POC iteration and is spent |
+| **THE INFRA RELEASE** | **2.2.0** — 239 tests, five adversarial review passes, `sha256 f2d3a59e…`, `Implementation-Build 1bf157e…`. The 2.1.x line (2.1.1–2.1.8) was POC iteration and is spent |
 | **Defaults** | `managedAuthentication = false`, `observeOnly = true`. Observe-only has **no effect** until the master switch is on — verified in source, not assumed |
 | **Versioning** | `major.minor.patch`. A plain `mvn verify` yields `-SNAPSHOT (private-…)`, deliberately not installable; a release needs `mvn -Dchangelist= clean verify` |
-| **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f` — clean state, scope back to `poc-canary-*`, observe-only off |
+| **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f` — running the release binary, left at the shipping defaults: managed auth **off**, observe-only **on** |
 | ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md |
 
 ### Coverage, as measured
