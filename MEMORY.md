@@ -3616,3 +3616,46 @@ it correctly declines rather than guessing.
 **Before enabling it anywhere, confirm the target job actually renders a static `assume_role`.** Run
 the bundled `Scan` against that job's checked-out repository; `WOULD WRITE 0` means there is nothing to
 fix, not that the feature is broken.
+
+### Session 25 addendum 12 — the attribution gap is ONE live job, not ten
+
+Last-run dates for all nine jobs previously listed as unattributable. Eight are effectively dead:
+
+| Job | Last run | Age | State |
+|---|---|---|---|
+| non-prod-ck-java-backend-deployment | 2022-12-16 | 1340d | dormant |
+| ck-network-services-poc-terraform | 2023-01-18 | 1307d | **disabled** |
+| non-prod-poc-ck-eks-base-setup | 2023-01-18 | 1307d | **disabled** |
+| ck-route53-terraform | 2023-03-24 | 1242d | **disabled** |
+| ck-ecs-terraform | 2023-04-18 | 1217d | dormant |
+| ck-analytics-app-services-terraform | 2023-04-24 | 1211d | dormant |
+| cognito-backup-dev | 2023-07-20 | 1124d | dormant |
+| gradle-test-job | — | — | **never run** |
+| **qa-virtuoso-resource-creation** | **2026-08-16** | **1d** | **ACTIVE, runs daily** |
+
+**So the live attribution gap is one job.** `qa-virtuoso-resource-creation` runs daily (#477, #478 on
+consecutive days), has no notifications, and does:
+
+```
+aws sts assume-role --role-arn ${roleArn} --role-session-name jenkins-session --output json
+  -> "AWS_ACCESS_KEY_ID=${creds1.AccessKeyId}", ...
+```
+
+It exports the resulting credentials as environment variables, so every later AWS call in that build
+uses them directly and **never consults `AWS_CONFIG_FILE`**. The plugin cannot reach it by any
+mechanism — this is the strongest form of the explicit-argument case.
+
+**One-line fix, with a fallback that is safe even if the plugin is off:**
+
+```
+--role-session-name "${CK_AWS_SESSION_NAME:-jenkins-session}"
+```
+
+**Consequence for the rollout:** the two jobs the `TerraformOverride` feature was built for
+(`ck-analytics-app-services-terraform`, `ck-ecs-terraform`) have not run in over three years. The
+feature is correct and proven on canaries, but it is **not urgent**, which further supports shipping
+with `terraformOverridePattern` blank and enabling it only if either job is revived.
+
+**Method note:** always check *last-run dates* before sizing an attribution gap. A grep over job
+configs counts jobs that exist; it says nothing about jobs anyone runs. Sizing this by config count
+produced "10 jobs" and three sessions of concern; sizing it by activity produced "one job, one line".
