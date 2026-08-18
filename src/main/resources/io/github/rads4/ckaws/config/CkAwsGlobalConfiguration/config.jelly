@@ -30,15 +30,9 @@
     </f:entry>
 
     <f:entry
-        title="AWS profiles"
-        description="Optional. The agent's own AWS configuration is the source of truth and is used as-is; entries here are only added for profiles the agent does not define. Leave the role ARN blank for a profile that should use the agent's own identity.">
-      <f:repeatableProperty field="profiles" add="Add profile" minimum="0"/>
-    </f:entry>
-
-    <f:entry
         title="Agent base identity"
         field="credentialSource"
-        description="Leave this alone unless the Jenkins AGENTS themselves run on ECS/EKS — this is about where the agent process runs, not where your applications are deployed. It answers one question: when a profile assumes a role, where do the starting credentials come from? Ec2InstanceMetadata for EC2 agents (the usual case), EcsContainer for agents running as ECS/Fargate tasks, Environment when the agent already has credentials in its environment. It applies ONLY to profiles this plugin writes — the [default] used for unprofiled attribution, and any profile added in the list above. Profiles copied from the agent's own configuration keep their own setting.">
+        description="Leave this alone unless the Jenkins AGENTS themselves run on ECS/EKS — this is about where the agent process runs, not where your applications are deployed. It answers one question: when a profile assumes a role, where do the starting credentials come from? Ec2InstanceMetadata for EC2 agents (the usual case), EcsContainer for agents running as ECS/Fargate tasks, Environment when the agent already has credentials in its environment. It applies ONLY to the [default] section this plugin writes for unprofiled attribution. Every profile copied from the agent's own configuration keeps whatever it already says.">
       <f:select/>
     </f:entry>
 

@@ -336,12 +336,15 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
      * and a cleared text field are both <em>absent</em> from the JSON, so without this a value could
      * never be turned off again once set.
      *
-     * <p><b>{@code nodeLabelPattern} and {@code unprofiledRoleArn} are deliberately NOT reset here.</b>
+     * <p><b>{@code profiles}, {@code nodeLabelPattern} and {@code unprofiledRoleArn} are deliberately NOT
+     * reset here.</b>
      * They no longer appear on the form, so the submitted JSON never carries them; resetting them would
      * mean any admin pressing Save — even for an unrelated setting — silently erased a value that can
-     * now only be set through configuration XML. For {@code nodeLabelPattern} the erasure widens scope
-     * from one agent to every node on the controller, which is the dangerous direction. Only fields the
-     * form actually submits may be reset from the form.
+     * now only be set through configuration XML or JCasC. For {@code nodeLabelPattern} the erasure widens
+     * scope from one agent to every node on the controller, which is the dangerous direction; for
+     * {@code profiles} it would quietly discard an operator's JCasC-managed list the first time anyone
+     * pressed Save for an unrelated reason. Only fields the form actually submits may be reset from the
+     * form.
      */
     @Override
     public boolean configure(StaplerRequest2 req, JSONObject json) throws FormException {
@@ -357,7 +360,6 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
         // on the controller into scope and drop the exclusion that was containing an incident. Recording
         // which keys arrived and applying defaults AFTER the bind means each field moves from its old
         // value straight to its new one, and no reader can observe the gap.
-        boolean hasProfiles = json.has("profiles");
         boolean hasManaged = json.has("managedAuthentication");
         boolean hasInclude = json.has("jobNamePattern");
         boolean hasExclude = json.has("jobNameExcludePattern");
@@ -368,9 +370,6 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
 
         req.bindJSON(this, json);
 
-        if (!hasProfiles) {
-            profiles = List.of();
-        }
         if (!hasManaged) {
             managedAuthentication = false;
         }

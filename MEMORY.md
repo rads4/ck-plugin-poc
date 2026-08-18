@@ -3848,3 +3848,51 @@ there.**
 Generalising a POC artefact into the infra runbook is precisely the failure mode this whole exercise
 was meant to avoid. When something on the clone behaves oddly, check whether a `pocInit*` hook causes
 it before writing it down as Jenkins behaviour.
+
+### Session 25 addendum 18 — `profiles` removed from the UI; the M11 layer deliberately kept
+
+**Removed from the form, not from the code.** `AWS profiles` no longer appears in the configuration
+page. `AwsProfile`, `usableProfiles()` and `AwsConfigOverlay.appendOverrides` are untouched — this was
+a change to one jelly file and nothing else. **UI is now seven fields.**
+
+**Why it was safe, verified four ways rather than assumed:**
+
+```
+job configs using ckAwsWithProfile / ckAwsAssumeRole : 0   (all 802 jobs)
+build logs mentioning ckAwsWithProfile               : 0   (covers SCM Jenkinsfiles that ran)
+Jenkinsfiles / .groovy in workspaces                 : 0
+<profiles/> in the plugin config                     : EMPTY
+```
+
+The decisive one: **with an empty list, `ckAwsWithProfile` cannot work anyway** — it aborts with "No AWS
+profile named 'x' is configured". Any job using it would already be failing, and none is.
+
+**A real defect was caught by doing it.** Two form round-trip tests failed immediately: removing a field
+means `configure()` clears it on the next Save, so an operator's JCasC-managed profile list would be
+silently discarded the first time anyone pressed Save for an unrelated reason. Fixed the same way as
+`nodeLabelPattern` and `unprofiledRoleArn` — **`configure()` no longer resets `profiles`**. Only fields
+the form actually submits may be reset from the form.
+
+**Why the M11 layer itself was NOT removed**, despite being unused. Measured before deciding:
+
+```
+M11 explicit-step layer : ~2,065 lines
+Total main code         :  4,720 lines   -> ~44% of the plugin
+Test classes to rewrite :  9
+SessionName             : SHARED with the managed path, cannot be deleted
+```
+
+Removing it means changing four public signatures on **`AwsConfigOverlay`** and deleting
+`appendOverrides` — inside the class that writes the AWS config file, the one that caused the
+production `DuplicateOptionError`, needed the SSO identity guard, and needed the configparser parser
+rewrite. **Five review passes examined the plugin in its current shape; a 44% change invalidates that
+coverage** for zero functional gain, since the code is inert and cannot fail a build or leave a job
+unaudited.
+
+The rule that decided every removal this session: **remove what is dangerous or free to remove; keep
+what is merely unused when removing it touches the safety-critical writer.** The static ARN field and
+`TerraformOverride` went because they could break builds. This stays. Scheduled as its own cleanup
+release, with its own review cycle.
+
+**Release artifact: `sha256 19db49ccde34b1a1fb0d4d1fd878df24c8d0f64c39aff6422af88d24932552a3`,
+Plugin-Version 2.2.0, 237 tests, 14/14 canaries.**

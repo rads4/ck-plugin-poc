@@ -10,7 +10,7 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 2.2.0 — 237 tests green. 2.1 is what is installed on CK production.**
+**Status: 2.2.0 — 237 tests green, five review passes. 2.1 is what is installed on CK production.**
 
 > **Versioning is `major.minor.patch`** (adopted 2026-08-17):
 >
