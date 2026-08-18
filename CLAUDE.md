@@ -262,6 +262,35 @@ Both must read 0. At 11:22 UTC on 2026-08-18 they read 5 and 2 — `prod/fe #156
 `dev3/Stormus-Build-Publish-NexusJob #142` running, with `nonprod-ck-drupal-deploy-app #1598`
 queued for an executor.
 
+### 4c. The restart activates more than ck-aws — known as of 2026-08-18
+
+The upload landed cleanly at 11:41 UTC: `plugins/ck-aws.jpi` is 95,749 bytes,
+`Plugin-Version 2.2.0`, `Implementation-Build 1bf157ee…`, sha256
+`f2d3a59eb808ccf4ffb0a9166f21eef43edf9d95b0b6b6ce72691ec46dbbbaa6` — byte-identical to the
+artifact the canaries ran against. It was the only thing written; nothing else in `plugins/`
+changed in that hour, and no `.pending`/`.tmp` was left behind.
+
+But Jenkins' *Download progress* page lists the whole update-centre queue, not just the current
+action, and it showed two more entries. Both were staged on **17 Aug 05:53**, a day earlier and
+unrelated to this work, and both have been waiting for a boot ever since:
+
+| Plugin | Staged | Note |
+|---|---|---|
+| `role-strategy` | 17 Aug | **This is the live authorization strategy** — `config.xml` names `RoleBasedAuthorizationStrategy`. Its `.bak` is from Nov 2025 |
+| `commons-lang3-api` | 17 Aug | Library, almost certainly role-strategy's dependency. `.bak` from Sep 2024 |
+
+**So the next restart activates three plugin upgrades, only one of which is ours**, and one of
+the other two governs who can do what in Jenkins. ck-aws lands inert; role-strategy does not.
+If permissions misbehave after the restart, look there first — and do not let a role-strategy
+regression get attributed to ck-aws, or vice versa.
+
+Two clean options, both the operator's call: restart and accept all three, or restore
+`role-strategy.bak` and `commons-lang3-api.bak` over their `.jpi` first so the restart carries
+only ck-aws. The second buys unambiguous attribution at the cost of one extra write.
+
+Not caused by the upload — they would have activated at the next boot regardless. We inherit
+them only because we are the reason a restart is being scheduled.
+
 ### 5. `numExecutors` — a POC artefact, NOT an infra concern
 
 Executors reset to 0 on every restart **of the clone**, which stalled a real queued build
