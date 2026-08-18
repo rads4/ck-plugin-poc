@@ -13,7 +13,7 @@
 | **Defaults** | `managedAuthentication = false`, `observeOnly = true`. Observe-only has **no effect** until the master switch is on — verified in source, not assumed |
 | **Versioning** | `major.minor.patch`. A plain `mvn verify` yields `-SNAPSHOT (private-…)`, deliberately not installable; a release needs `mvn -Dchangelist= clean verify` |
 | **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f` — clean state, scope back to `poc-canary-*`, observe-only off |
-| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. Note `numExecutors` resets to 0 on every restart |
+| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md |
 
 ### Coverage, as measured
 
@@ -3832,3 +3832,19 @@ append `session_name`.
 **Final artifact: `sha256 40f24324eb6240cb96ce95ddb4cfa109b68ca4a6de0d8f0cdb1a8d7e76dbea54`,
 Plugin-Version 2.2.0, 237 tests, 0 failures.** Installed on the clone; **14/14 canaries pass**. The UI
 is unchanged at eight fields.
+
+### Session 25 addendum 17 — correction: the executor reset is a POC artefact
+
+Earlier notes told the reader to "check `numExecutors` after the restart" because it reset to 0 on
+every restart of the clone and silently stalled a real queued build. **That advice was wrong for
+infra, and the correction matters more than the original observation.**
+
+The cause is `init.groovy.d/pocInit06KillResumedBuilds.groovy:103`, which calls
+`Jenkins.get().setNumExecutors(0)` on every start. It is one of six `pocInit*.groovy` neutralisation
+hooks **pushed onto the clone after it was built** — deliberately, to stop resumed production builds
+running there. They were never in the AMI, so **infra has no such hook and executors will not reset
+there.**
+
+Generalising a POC artefact into the infra runbook is precisely the failure mode this whole exercise
+was meant to avoid. When something on the clone behaves oddly, check whether a `pocInit*` hook causes
+it before writing it down as Jenkins behaviour.

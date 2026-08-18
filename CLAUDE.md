@@ -131,7 +131,15 @@ labelled*, you are running an older build.
 Install with the switch **off** → restart (the one restart) → switch **on** with
 observe-only → read a day of console evidence → untick observe-only.
 
-### 4. Accept these three known limits before starting
+### 4. `numExecutors` — a POC artefact, NOT an infra concern
+
+Executors reset to 0 on every restart **of the clone**, which stalled a real queued build during
+testing. The cause is POC-only: `init.groovy.d/pocInit06KillResumedBuilds.groovy` calls
+`setNumExecutors(0)` on every start, to stop resumed production builds running on a clone. Infra has
+no `pocInit*` hooks — they were pushed onto the clone after it was built, never part of the AMI. **Do
+not carry this step into the infra runbook.**
+
+### 5. Accept these three known limits before starting
 
 - **3 of 802 jobs** (`cln-app-terraform-pipeline`, `ck-analytics-app-services-terraform`,
   `ck-ecs-terraform`) have provider-level `assume_role`; their post-hop calls carry
