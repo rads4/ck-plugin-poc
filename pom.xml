@@ -59,7 +59,7 @@
       is `-SNAPSHOT (private-<hash>-<user>)`, which is deliberately NOT installable - that
       is what keeps the number provisional until installation.
     -->
-    <revision>2.1.8</revision>
+    <revision>2.2.0</revision>
     <changelist>-SNAPSHOT</changelist>
     <!--
       Baseline is pinned to CloudKeeper's actual Jenkins version (2.479.2) rather than the

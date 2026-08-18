@@ -258,5 +258,9 @@ class ProductionFailureModesTest {
         configuration.setNodeLabelPattern(null);
         configuration.setUnprofiledRoleArn(null);
         configuration.setManagedAuthentication(true);
+        // Enforcing, explicitly. observeOnly ships ON, and these tests exist to exercise the path that
+        // actually exports — the only one that can affect a build. The observe-only test below opts back
+        // in deliberately after calling this.
+        configuration.setObserveOnly(false);
     }
 }

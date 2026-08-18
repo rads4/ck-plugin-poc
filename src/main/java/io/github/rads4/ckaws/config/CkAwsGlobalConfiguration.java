@@ -97,7 +97,17 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
 
     private volatile boolean diagnostics;
 
-    private volatile boolean observeOnly;
+    /**
+     * Ships <b>on</b>, unlike every other setting.
+     *
+     * <p>It has no effect until {@link #isManagedAuthentication()} is also enabled — the master switch
+     * is checked first, so a fresh install still does nothing at all. What this default decides is what
+     * happens at the moment an administrator <em>does</em> turn the master switch on: with observe-only
+     * already selected, that first action reports what would happen and exports nothing, instead of
+     * changing the environment of every in-scope build at once. Enforcing then becomes a second,
+     * deliberate click rather than a side effect of the first.
+     */
+    private volatile boolean observeOnly = true;
 
     @NonNull
     private volatile String credentialSource = DEFAULT_CREDENTIAL_SOURCE;

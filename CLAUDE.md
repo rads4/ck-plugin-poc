@@ -118,12 +118,12 @@ labelled*, you are running an older build.
 
 | Field | Value | Why |
 |---|---|---|
-| *Managed authentication* | **off** at first | Install and restart with it off; turn on afterwards without a restart |
+| *Managed authentication* | **off** (the default) | Install and restart with it off; turn on afterwards without a restart. **Observe-only does nothing until this is on** — the master switch is checked first on both the Pipeline and Freestyle paths |
 | *Apply to jobs matching* | blank | Observe-only makes full scope safe |
 | *Except jobs matching* | blank | Reserved as the incident switch |
 | *Attribute unprofiled calls as the node's own instance role* | **ticked** | This is what audits ~98% |
 | *AWS profiles* | empty | Never once used |
-| *Observe only* | **ticked** | Enforce only after reading a day of real traffic |
+| *Observe only* | **ticked — now the shipped default** | So that the moment someone turns the master switch on, the safe mode is already selected rather than every in-scope build changing at once. Enforcing is then a second, deliberate click |
 | *Diagnostics* | ticked | Turn off once the rollout is settled |
 
 ### 3. Rollout order

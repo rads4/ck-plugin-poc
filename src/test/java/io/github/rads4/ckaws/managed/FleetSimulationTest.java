@@ -158,5 +158,10 @@ class FleetSimulationTest {
         configuration.setNodeLabelPattern(null);
         configuration.setUnprofiledRoleArn(unprofiledRoleArn);
         configuration.setManagedAuthentication(true);
+        // Explicitly enforcing. observeOnly ships ON so that turning the master switch on for the
+        // first time cannot change every build at once — but these tests exist to exercise the
+        // ENFORCING path, the only one that can affect a build. Without this line they would all
+        // silently run in observe-only and assert nothing about what is exported.
+        configuration.setObserveOnly(false);
     }
 }

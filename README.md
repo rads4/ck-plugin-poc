@@ -10,7 +10,7 @@ service-specific, or deployment-specific logic. Anything that consumes AWS
 credentials — the AWS CLI, boto3, Terraform, Docker — consumes them the way it
 always does.
 
-**Status: 232 tests green. 2.1 is what is installed on CK production.**
+**Status: 2.2.0 — 249 tests green. 2.1 is what is installed on CK production.**
 
 > **Versioning is `major.minor.patch`** (adopted 2026-08-17):
 >
@@ -39,8 +39,8 @@ always does.
 > | 2.2 — `f5150ba3…` | Test install on the POC clone. The build validated against real jobs — every canary, all 7 agent types, `dev2/fluentd #119`. **Spent** |
 > | 2.3 — `bc4d59e1…` | Test install on the POC clone; static ARN form entry removed. **Spent** |
 > | 2.4 | Built, never installed, superseded by the review fixes. Not spent |
-> | **2.1.1** | Current POC line. Carries every code-review fix |
-> | 2.2.0 | **Reserved for the infra install.** Never to be used on the clone |
+> | 2.1.1 – 2.1.8 | POC iterations. All spent on the clone |
+> | **2.2.0** | **The infra release.** 249 tests, four review passes |
 >
 > Every *earlier* artifact calling itself 2.2, 2.3 or 2.4 is void — including
 > `b4c94c78…` (no environment invariant), `edde1e04…` (misleading observe-only

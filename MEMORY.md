@@ -4,17 +4,35 @@
 > first, and it is long. This block is the current state; consult the history only when
 > you need the reasoning behind a specific decision.
 
-## Current state — 2026-08-16
+## Current state — 2026-08-18
 
 | | |
 |---|---|
-| **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is being audited today. Infra has not been restarted, reconfigured or installed to at any point |
-| **Versioning** | **`major.minor.patch`** since 2026-08-17. Development builds are `2.2.0-SNAPSHOT (private-…)` and are **deliberately not installable**; the release number is claimed at install time with `mvn -Dchangelist= clean verify` |
-| **Current code** | 228 tests green. Two form entries removed, plus **six code-review fixes**. No release artifact exists — build one only when installing |
-| **On the POC clone** | **2.3**, `bc4d59e1…` — installed, so that number is spent. **Predates the six fixes**, so the clone is not running current code |
-| **Last build validated against real jobs** | **2.2** `f5150ba3…` — preserved on the instance at `/var/lib/poc-artifacts/ck-aws-2.2-VALIDATED-f5150ba3.jpi`. 2.3 changes only the form, but has no real-job evidence of its own yet |
-| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. Build releases with `mvn -Dchangelist= clean verify`; rebuilding gives a different hash from identical source — see addendum 10 |
-| **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f`, `10.20.80.237` — built from a post-migration AMI, running 2.2. See `poc-jenkins-setup/STATE.md` |
+| **On CK production (infra Jenkins)** | ck-aws **2.1**, master switch **OFF**. Nothing is audited today. Infra has never been restarted, reconfigured or installed to during this work |
+| **THE INFRA RELEASE** | **2.2.0** — 249 tests, four adversarial review passes. The 2.1.x line (2.1.1–2.1.8) was POC iteration and is spent |
+| **Defaults** | `managedAuthentication = false`, `observeOnly = true`. Observe-only has **no effect** until the master switch is on — verified in source, not assumed |
+| **Versioning** | `major.minor.patch`. A plain `mvn verify` yields `-SNAPSHOT (private-…)`, deliberately not installable; a release needs `mvn -Dchangelist= clean verify` |
+| **POC clone** | `poc-jenkins-2`, `i-0cdd407bce366be0f` — clean state, scope back to `poc-canary-*`, observe-only off |
+| ⚠️ **Before installing** | Read the **PRE-INSTALL CHECKLIST** at the top of CLAUDE.md. Note `numExecutors` resets to 0 on every restart |
+
+### Coverage, as measured
+
+| Job type / mechanism | Evidence |
+|---|---|
+| SCM Pipeline (622) | `dev2/fluentd` — 35 CloudTrail events on 2.2; unprofiled `ecr get-login-password` attributed |
+| Inline Pipeline (111) | `CodeArtifact-PoC` — `GetAuthorizationToken`; also proved `sh()` inside `environment{}` |
+| Freestyle (69) | `ckaws-canary-freestyle-master` — cross-account `jk-` in two accounts |
+| Terraform | `cln-app-terraform-pipeline` — 10 AssumeRole events, **all** `jk-` |
+| AWS CLI / boto3 | both, profiled and unprofiled |
+| Canaries | 14/14 green |
+
+### The one live gap
+
+`qa-virtuoso-resource-creation` (runs daily) assumes a role explicitly and **exports the credentials as
+environment variables**, which outrank `AWS_CONFIG_FILE` in every AWS SDK. Measured exactly: calls
+before the assume are attributed, the `AssumeRole` itself is attributed to the build, calls after are
+not — but remain one join away. **One line in that repo fixes it**; no plugin can. Every other job
+previously listed as a gap is disabled, dormant 1100+ days, or has never run.
 
 ### What 2.2 contains beyond 2.1
 
@@ -3691,3 +3709,99 @@ Jenkins plugin can change this**, which is why the fix is one line in that job's
 
 **Nothing failed.** The canary succeeded, which is the property that matters most: a job of this shape
 is unaffected by the plugin.
+
+### Session 25 addendum 14 — 2.2.0: the infra release
+
+**Version 2.2.0.** The 2.1.x line (2.1.1 – 2.1.8) was POC iteration and is spent; 2.2.0 was reserved
+for infra from the start and is now claimed.
+
+**The two switches, and how they relate.** Verified in source rather than assumed:
+`isManagedAuthentication()` is checked **first** on both paths — `ManagedAwsContext` line 247,
+`ManagedAwsFreestyleEnvironment` line 81 — and `isObserveOnly()` only later (287 / 116). So
+**observe-only does nothing unless managed authentication is on**; with the master switch off the
+plugin returns immediately and is indistinguishable from not being installed.
+
+Defaults therefore ship as **managedAuthentication = false, observeOnly = true**. That pair is
+deliberate: a fresh install does nothing at all, and the moment an administrator turns the master
+switch on, the safe mode is *already selected* — the first action reports what would happen and
+exports nothing, rather than changing the environment of every in-scope build at once. Enforcing
+becomes a second, deliberate click.
+
+**The plugin is not customised for the POC — verified, not assumed.** Grepping all of `src/main` for
+`poc`, agent hostnames, instance IDs, account numbers, `cloudkeeper`, `ck-ops-jenkins`,
+`jenkins-slave`, `bitbucket`, absolute paths and hardcoded ARNs/regions found **7 hits, all of them
+javadoc or comments**. No hardcoded path, ARN, account, region or hostname exists in shipped code. The
+only environment-specific values are the ones an administrator configures.
+
+**Observe-only: what it records and where.** It runs the whole path — reads the node's config,
+decorates, validates, and *writes* the file to `<workspace>@tmp/ck-aws/config` — and withholds only
+the export. Its record lives **in the build console log and nowhere else**; there is no database and
+no index.
+
+⚠️ **Retention caveat for anyone planning to read that evidence later:** on this controller **544 of
+806 jobs have a build discarder** and 262 keep everything. For a frequently-run job keeping only a few
+builds, a day-old observe-only record may already have rotated away. Sweep the logs periodically
+during the observation window rather than once at the end.
+
+**Canaries on infra.** Six `ckaws-canary-*` jobs came across in the AMI and therefore exist on infra
+today: `ckaws-canary`, `-master`, `-drupal`, `-pdf`, `-freestyle`, `-freestyle-master`. They only run
+`aws sts get-caller-identity`, so they are harmless and useful as post-install smoke tests. The ~20
+`poc-*` canaries were created on the clone and exist **only** there — nothing on the clone propagates
+to infra, which has a separate instance, EBS volume and `JENKINS_HOME`.
+
+### Session 25 addendum 15 — fourth review: the default change broke 23 tests
+
+Changing `observeOnly` to default `true` **broke 23 tests**, and the fourth review caught it before any
+artifact was built. The failure was not the default itself but what it exposed: nearly every test
+enabled managed authentication through a helper that never touched `observeOnly`, so with the new
+default they all silently ran in **observe-only** — asserting nothing about what is exported.
+
+**The regression net for the enforcing path — the only path that can change a build — had switched
+itself off, while still reporting 249 tests.** A green suite that tests the wrong mode is worse than a
+red one.
+
+Fixed by making the intent explicit in every enforce-path helper (`ManagedAwsContextTest`,
+`ManagedAwsFreestyleEnvironmentTest`, `FleetSimulationTest`, `AgentCoverageTest`,
+`ProductionFailureModesTest`) plus `ObserveOnlyDefaultTest`, which pins the shipped pair so a future
+accidental flip fails loudly. **250 tests, 0 failures.**
+
+**Upgrade semantics, verified rather than reasoned.** Field initialisers run before the constructor
+body, and XStream never clears a field whose element is absent, so:
+
+- v2.1 has no `observeOnly` element in its XML → **infra will get the new default `true`** — intended
+- a controller whose XML *does* carry `observeOnly=false` keeps false — the admin's saved choice wins
+
+Confirmed empirically on the clone: after upgrading to 2.2.0 its saved `observeOnly=false` survived.
+The wrinkle worth remembering: on such a controller, later enabling the master switch goes straight to
+enforcing with no observe-only phase.
+
+**`managedAuthentication` cannot be turned on by an upgrade** — no initialiser, set only from saved XML
+or a deliberate admin action, and defaulted to false when absent from a form submission.
+
+**The OFF state is inert, traced on both paths.** Pipeline `contribute` does an extension lookup and one
+volatile read before returning; the first call that could do I/O comes after the check. Freestyle is
+the same shape. Blank `terraformOverridePattern` returns false before `TerraformOverride` is touched.
+
+### 2.2.0 — the artifact
+
+`sha256 966d1500a0ad43c2b3085cc40372d8d0820cf5f78c48b5a33339b589a8813742`, `Plugin-Version: 2.2.0`,
+250 tests, four adversarial review passes. Installed on the clone and **14/14 canaries pass**.
+
+### ⚠️ Do NOT enable `terraformOverridePattern` until two defects are fixed
+
+Both found by the fourth review, both able to **fail a build**. Harmless today only because the pattern
+ships blank.
+
+1. **Malformed HCL when `role_arn` spans multiple lines.** `attributeLine` extracts a single line, so a
+   `role_arn = format("arn:aws:iam::%s:role/%s",` continuation is copied truncated →
+   `Error: Missing argument separator` → `init`/`plan` fail.
+2. **Sibling attributes silently dropped.** Only `role_arn` is copied, and Terraform replaces the nested
+   block wholesale — so `external_id`, `duration`, `policy`, `policy_arns`, `source_identity` vanish.
+   A role requiring an ExternalId then fails with AccessDenied; dropping `policy_arns` instead
+   *widens* the session's permissions silently.
+
+**One fix closes both: copy the entire original `assume_role` body verbatim and append a single
+`session_name` line**, rather than reconstructing from `role_arn`. Also outstanding before enabling:
+`terraform fmt -check` fails on the generated file (alignment); the writer half (`applyTo`,
+`WriteOverrides`) has no tests; the walk follows symlinks; observe-only does not suppress the write;
+and any admin Save silently clears the pattern because it is in no jelly.
