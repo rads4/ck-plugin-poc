@@ -3907,12 +3907,12 @@ Plugin-Version 2.2.0, 237 tests, 14/14 canaries.**
 
 ```
 Plugin-Version : 2.2.0
-sha256         : 19db49ccde34b1a1fb0d4d1fd878df24c8d0f64c39aff6422af88d24932552a3
+sha256         : 98fb48b2e2dc11c53c21a758dd9515f19c92c74f8fe790a736f8bde021698509
 artifact       : poc-jenkins-setup/artifacts/ck-aws-2.2.0-final.hpi
-tests          : 237, 0 failures, 1 skipped
+tests          : 239, 0 failures, 1 skipped
 canaries       : 14/14 on the release build
 UI             : 7 fields
-reviews        : 5 adversarial passes (a 5th was running at checkpoint time — see OPEN below)
+reviews        : 5 adversarial passes, ALL COMPLETE. Fifth verdict: SAFE TO INSTALL
 ```
 
 | Where | What |
@@ -3922,9 +3922,13 @@ reviews        : 5 adversarial passes (a 5th was running at checkpoint time — 
 
 ## OPEN AT CHECKPOINT
 
-1. **A fifth code review was still running.** If its findings never arrived, re-run one before installing.
-2. **~19 commits are LOCAL ONLY.** `git push` is blocked by Rads' mutation hook; she must push or approve.
-3. Infra Jenkins has **not** been inspected — she has kept a standing no-contact rule. Needs her explicit go-ahead.
+1. **~20 commits are LOCAL ONLY.** `git push` is blocked by Rads' mutation hook; she must push or approve.
+2. Infra Jenkins has **not** been inspected — standing no-contact rule. Needs explicit go-ahead.
+3. ⚠️ **Before installing, check infra's `$JENKINS_HOME/io.github.rads4.ckaws.config.CkAwsGlobalConfiguration.xml`
+   for `<managedAuthentication>`.** The clone's copy says `true`. If infra's does too, the plugin becomes
+   active in observe-only mode on restart rather than dormant — safe (nothing exported) but every
+   in-scope build then reads its agent config and writes a temp file. If it is `false` as expected, the
+   install is a complete no-op until someone deliberately opts in.
 
 ## The install procedure
 
@@ -3986,3 +3990,35 @@ the clone.
 - Set up gap detection: the log recorder above, plus CloudTrail bucketed by session-name shape
   (`jk-*` audited; `i-0*` / `aws-go-sdk-*` / 32-hex = gap)
 - The one-line fix to `qa-virtuoso-resource-creation`
+
+## Fifth review — verdict and what it changed
+
+**SAFE TO INSTALL. No critical, high or medium finding.** The reviewer independently verified the
+build (237 tests at the time, SpotBugs 0), traced the `TerraformOverride` deletion as clean with zero
+dangling references, and confirmed the off state is inert on both paths — including a bytecode check
+that a `null` from a `DynamicContext` continues the search rather than shadowing, so the rivon defect
+class cannot recur while off.
+
+Most valuable confirmation: it proved **two independent ways** — a live probe through Jenkins' real
+`XmlFile`/`XStream2`, and a bytecode trace of `Descriptor.load` — that unmarshalling writes only the
+elements actually present, so **a 2.1 config lacking `<observeOnly>` yields `true`**. That is now also
+pinned by `UpgradeFromOlderVersionTest`.
+
+**Three LOW findings fixed rather than shipped:**
+
+1. **`isBenignRace` could hang a build thread.** Its `c.getCause() == c` guard was **dead code**
+   (`getCause()` returns null, never `this`), and a cyclic cause chain — constructible via the public
+   API — made the loop non-terminating. Inside the fail-open guard a hang is worse than an exception:
+   the build would neither fail nor proceed. Now depth-bounded at 20.
+2. **`NODE_ROLE_ARNS` grew without bound** — one permanent entry per ephemeral agent ever provisioned.
+   Now capped at 500 entries.
+3. **`configure()` defaulted `observeOnly` to `false` when absent**, the one field whose inert value is
+   ON. Unreachable from the real UI (a checkbox always submits its key) but wrong in principle. Now
+   defaults to `true`, matching the field initialiser.
+
+**Left as accepted:** assorted dead code (`preparedCount`/`preparedKeys`, two `doCheck*` methods with no
+matching form field), and a doc nit — the `credentialSource` help text says it applies only to
+`[default]`, while `appendOverrides` also writes `credential_source` for appended profiles. True on a
+fresh install (empty list), inaccurate on an upgrade carrying profiles.
+
+**Final: 239 tests, 0 failures, 14/14 canaries on the shipping artifact.**

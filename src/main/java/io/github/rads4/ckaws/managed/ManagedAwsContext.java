@@ -147,6 +147,9 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      */
     private static final String UNRESOLVABLE = "(node-role-unresolvable)";
 
+    /** Upper bound on {@link #NODE_ROLE_ARNS}; far above any real fleet's concurrent node count. */
+    private static final int MAX_CACHED_NODE_ROLES = 500;
+
     @Override
     protected Class<EnvironmentExpander> type() {
         return EnvironmentExpander.class;
@@ -217,13 +220,16 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
      * unknown failure is never silently downgraded.
      */
     private static boolean isBenignRace(Throwable t) {
-        for (Throwable c = t; c != null; c = c.getCause()) {
+        // Bounded, because this runs inside the fail-open guard. A cyclic cause chain is constructible
+        // through the public API (a.initCause(b); b.initCause(a)), and an unbounded walk over one would
+        // hang the build thread here — worse than any exception, since the build would then neither fail
+        // nor proceed. The previous `c.getCause() == c` guard was dead code: getCause() returns null when
+        // no cause is set, never this. A depth cap is what Throwable.printStackTrace does too.
+        int depth = 0;
+        for (Throwable c = t; c != null && depth < 20; c = c.getCause(), depth++) {
             String message = c.getMessage();
             if (message != null && message.contains("cannot start writing logs to a finished node")) {
                 return true;
-            }
-            if (c.getCause() == c) {
-                break;
             }
         }
         return false;
@@ -712,6 +718,13 @@ public final class ManagedAwsContext extends DynamicContext.Typed<EnvironmentExp
             return configuration.getUnprofiledRoleArn();
         }
         String nodeName = node == null ? "" : node.getNodeName();
+        // Bound the cache. Ephemeral cloud agents get a fresh node name each time, so without a cap this
+        // accumulates one permanent entry per agent ever provisioned. Clearing wholesale rather than
+        // evicting one entry is deliberate: it costs one IMDS probe per live node afterwards, and this
+        // only ever runs when unprofiled attribution is enabled.
+        if (NODE_ROLE_ARNS.size() > MAX_CACHED_NODE_ROLES) {
+            NODE_ROLE_ARNS.clear();
+        }
         String cached = NODE_ROLE_ARNS.get(nodeName);
         if (cached != null) {
             if (!UNRESOLVABLE.equals(cached)) {

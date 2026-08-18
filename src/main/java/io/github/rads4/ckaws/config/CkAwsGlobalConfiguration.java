@@ -386,7 +386,11 @@ public class CkAwsGlobalConfiguration extends GlobalConfiguration {
             diagnostics = false;
         }
         if (!hasObserveOnly) {
-            observeOnly = false;
+            // true, matching the field initialiser — NOT false. Every other absent-default here is the
+            // inert value; this is the one field where "inert" means ON. A checkbox always submits its
+            // key, so unticking still works; this branch only guards a hand-built POST that carries the
+            // master switch but omits this, where defaulting to enforcing would be the wrong direction.
+            observeOnly = true;
         }
         if (!hasCredentialSource) {
             credentialSource = DEFAULT_CREDENTIAL_SOURCE;
