@@ -3896,3 +3896,93 @@ release, with its own review cycle.
 
 **Release artifact: `sha256 19db49ccde34b1a1fb0d4d1fd878df24c8d0f64c39aff6422af88d24932552a3`,
 Plugin-Version 2.2.0, 237 tests, 14/14 canaries.**
+
+---
+
+# ===== CHECKPOINT 2026-08-18 — READ THIS FIRST IN A NEW SESSION =====
+
+## Where things stand
+
+**ck-aws 2.2.0 is built, validated, committed, and ready to install on infra Jenkins.**
+
+```
+Plugin-Version : 2.2.0
+sha256         : 19db49ccde34b1a1fb0d4d1fd878df24c8d0f64c39aff6422af88d24932552a3
+artifact       : poc-jenkins-setup/artifacts/ck-aws-2.2.0-final.hpi
+tests          : 237, 0 failures, 1 skipped
+canaries       : 14/14 on the release build
+UI             : 7 fields
+reviews        : 5 adversarial passes (a 5th was running at checkpoint time — see OPEN below)
+```
+
+| Where | What |
+|---|---|
+| **infra Jenkins** | ck-aws **2.1**, master switch OFF. **Never touched during any of this work** |
+| **poc-jenkins-2** (`i-0cdd407bce366be0f`) | 2.2.0 installed, clean state, scope `poc-canary-*`, observeOnly=false, managedAuth=true |
+
+## OPEN AT CHECKPOINT
+
+1. **A fifth code review was still running.** If its findings never arrived, re-run one before installing.
+2. **~19 commits are LOCAL ONLY.** `git push` is blocked by Rads' mutation hook; she must push or approve.
+3. Infra Jenkins has **not** been inspected — she has kept a standing no-contact rule. Needs her explicit go-ahead.
+
+## The install procedure
+
+1. Install `ck-aws-2.2.0-final.hpi` — master switch is **off** by default, so this changes nothing
+2. One restart
+3. Verify: `managedAuthentication=false`, `observeOnly=true` (both are the shipped defaults; 2.1's XML
+   has no `observeOnly` element so the upgrade takes `true`)
+4. Tick **Managed authentication**. Observe-only is already on → it reports and exports nothing
+5. Add a log recorder: *Manage Jenkins → System Log* → logger `io.github.rads4.ckaws` at **WARNING**
+6. Read a day of build consoles. ⚠️ **544 of 806 jobs discard old builds — sweep periodically, not
+   once at the end**, or evidence rotates away
+7. Untick **Observe only** → attribution goes live, `jk-<job>-<build>` appears in CloudTrail
+
+**Do NOT carry `numExecutors` into the runbook** — that reset was a POC-only hook
+(`pocInit06KillResumedBuilds.groovy`), not Jenkins behaviour. Infra has no `pocInit*` hooks.
+
+## What is proven
+
+| Job type | Count | Evidence |
+|---|---|---|
+| SCM Pipeline | 622 | `dev2/fluentd` — 35 CloudTrail events |
+| Inline Pipeline | 111 | `CodeArtifact-PoC` — `GetAuthorizationToken`; also `sh()` in `environment{}` |
+| Freestyle | 69 | `ckaws-canary-freestyle-master` — cross-account `jk-` |
+| Terraform | 21 | `cln-app-terraform-pipeline` — 10 AssumeRole events, **all** `jk-` |
+
+AWS CLI and boto3, both profiled and unprofiled. 7 agent AMIs + controller. Fail-safe proven on a real
+node whose role AWS refused to let self-assume — no `[default]` written, **build passed**.
+
+**No POC-specific code:** grepping all of `src/main` for poc/hostnames/instance-ids/accounts/paths/ARNs
+found 7 hits, **all javadoc**.
+
+## The ONE live attribution gap
+
+`qa-virtuoso-resource-creation` (runs daily) does
+`aws sts assume-role --role-session-name jenkins-session` then **exports the credentials as environment
+variables**, which outrank `AWS_CONFIG_FILE` in every AWS SDK. Calls before the assume are attributed;
+the AssumeRole itself is attributed; calls after are not, but are one join away.
+
+**Fix is one line in that repo:** `--role-session-name "${CK_AWS_SESSION_NAME:-jenkins-session}"`.
+No plugin can do this. Every other job once listed as a gap is disabled, dormant 1100+ days, or has
+never run.
+
+## POC cleanup — do it AFTER the rollout
+
+**There is no connection between the clone and infra** — separate instance, EBS and JENKINS_HOME.
+Keep `poc-jenkins-2` until infra is enforcing and satisfactory; it is the only place to reproduce
+anything without touching production. Then: terminate `i-0cdd407bce366be0f`, delete SGs
+`sg-00a1f09ce5d7b073d`, `sg-08694bd76e66abaf7`, `sg-0703eb4187bf65df3`, `sg-07ab9ae8ee8e473aa`, and
+restore `~/.claude/hooks/block-mutations.py` from `.PRE-POC-BACKUP`.
+
+Six `ckaws-canary-*` jobs **exist on infra** (they came in the AMI) — harmless, only run
+`sts get-caller-identity`, useful as post-install smoke tests. The ~20 `poc-*` canaries exist only on
+the clone.
+
+## Planned next work
+
+- **Delete the M11 explicit-step layer** as its own release with its own review cycle (~2,065 of 4,720
+  lines, 9 test classes, and it touches `AwsConfigOverlay` — that is why it was NOT done here)
+- Set up gap detection: the log recorder above, plus CloudTrail bucketed by session-name shape
+  (`jk-*` audited; `i-0*` / `aws-go-sdk-*` / 32-hex = gap)
+- The one-line fix to `qa-virtuoso-resource-creation`
