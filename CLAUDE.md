@@ -118,23 +118,45 @@ deliberately not installable.
 canaries re-run on this artifact after the rebuild, and real jobs of every type (see the
 coverage table in MEMORY.md). `poc-jenkins-2` is running it now.
 
-### 2. Read infra's existing config XML BEFORE the restart
+### 2. Infra's pre-install state — MEASURED 2026-08-18, not assumed
 
+Read-only survey of `i-0924a915a1c76f33e` (`jenkins-17`) over SSM with `ops-admin`.
+
+`$JENKINS_HOME/io.github.rads4.ckaws.config.CkAwsGlobalConfiguration.xml`, 334 bytes,
+last written 2026-08-12:
+
+```xml
+<io.github.rads4.ckaws.config.CkAwsGlobalConfiguration plugin="ck-aws@2.1">
+  <profiles/>
+  <managedAuthentication>false</managedAuthentication>
+  <diagnostics>false</diagnostics>
+  <credentialSource>Ec2InstanceMetadata</credentialSource>
+</io...>
 ```
-$JENKINS_HOME/io.github.rads4.ckaws.config.CkAwsGlobalConfiguration.xml
-```
 
-Infra runs 2.1, and its settings survive the upgrade. Two elements decide what happens the
-moment Jenkins comes back:
+**The master switch is off, confirmed.** And there is no `<observeOnly>` element — that field
+arrived in `59fc321`, after 2.1 — so the initialiser survives unmarshalling and infra lands on
+the new default `true`. Both fields therefore land in the safe position without anyone touching
+them. `<jobNamePattern>` and `<attributeUnprofiledAsNodeRole>` are absent too, so they come up
+blank and off. **The upgrade is inert: nothing changes for any build until someone ticks
+*Managed authentication* in the UI.**
 
-- `<managedAuthentication>` — memory records this as **off** on infra, which makes the
-  upgrade completely inert. **Confirm it rather than trusting the record**: if it is `true`,
-  the plugin goes live at whatever `<jobNamePattern>` that file names, on restart, with no
-  further action.
-- `<observeOnly>` — **2.1 has no such element** (it was introduced in `59fc321`, after 2.1).
-  An absent element leaves the field initialiser intact, so infra lands on the new default
-  `true`. Pinned by `UpgradeFromOlderVersionTest`. So even the `managedAuthentication = true`
-  case comes up in observe-only, which exports nothing to any build.
+| Compatibility | Required | Infra has | |
+|---|---|---|---|
+| Jenkins | 2.479.2 | 2.479.2 | exact |
+| Java | 17 | OpenJDK 17.0.19 | ok |
+| `workflow-step-api` | ≥ `700.v6e45cb_a_5a_a_21` | `710.v3e456cc85233` | ok |
+
+2.2.0 declares **the same single dependency as the 2.1 already loading successfully**, so the
+upgrade adds no new plugin surface. The diff from infra's installed build (`2288bd59`) to the
+release is additive — 2853 insertions, 67 deletions, no file removed — so **no step or symbol
+that a Jenkinsfile could reference has been withdrawn**. Independently: zero of the 808 job
+configs reference `ckAwsWithProfile` or `ckAwsAssumeRole`.
+
+Nothing re-applies configuration at boot: **no `init.groovy.d`, no JCasC, no backup plugin.**
+Disk has 85 GB free. `plugins/ck-aws.bak` is version 2.0 built from commit `2288bd59` — the
+*same commit* as the installed 2.1, which is another reason to trust `Implementation-Build` over
+version numbers.
 
 ### 3. Settings to apply at install time
 
@@ -162,6 +184,66 @@ it interrupts in-flight builds and disconnects agents. Everything after it is a 
 **Rollback:** put the 2.1 `.jpi` back and restart. Back up both files first —
 `plugins/ck-aws.jpi` and the config XML above. Once running, rollback is usually cheaper than
 that: unticking *Managed authentication* takes effect without a restart.
+
+### 4b. Pick the window — restart risk, measured
+
+Jenkins was last restarted **2026-08-11 06:27 UTC**, seven days ago, so a restart is a normal
+operation on this controller and not a once-a-year event.
+
+What a restart does to work in flight:
+
+- **Pipeline builds resume.** `workflow-durable-task-step 1452` persists step state; a build
+  mid-`sh` picks up where it left off.
+- **Freestyle builds are killed.** 39 job configs are `<project>` (Freestyle) and they do not
+  resume. This is the only thing a restart actually destroys.
+- **Queued items survive** — `queue.xml` is persisted and replayed.
+
+Build finish times per UTC hour over 14 days, from the build records themselves:
+
+```
+  07h  50 |####################################
+  10h  40 |#############################
+  09h  39 |############################
+  11h  30 |######################
+  06h  29 |#####################
+  05h  19 |##############
+  08h  18 |#############
+  13h  15 |###########
+  12h  12 |#########
+  14h   8 |######
+  04h   7 |#####
+  15h   6 |####          <- 20:30 IST
+  18h   6 |####
+  16h   5 |####          <- 21:30 IST
+  03h   5 |####
+  02h   3 |##
+  23h   3 |##
+  19h   2 |#
+  17h   1 |#             <- 22:30 IST, the quietest hour on the controller
+  20h,21h,22h,00h,01h: no builds at all in 14 days
+```
+
+**Recommended window: 17:00–18:00 UTC = 22:30–23:30 IST.** One build finished in that hour in
+the last fortnight, and no dated cron fires in it — the scheduled jobs sit at 00:00, 01:05,
+03:30, 06:30, 08:00, 11:30, 12:05, 13:00, 14:30 and 23:00 UTC. Two crons are hash-spread
+(`H */1 * * *` hourly, `H */6 * * *`) so they can land anywhere; check the queue is empty
+immediately before restarting rather than assuming.
+
+**Do not restart during 05:00–11:00 UTC** (10:30–16:30 IST) — that is the working peak, and it
+is when `prod/*`, `uat/*` and `qa1/*` deploys run.
+
+**How to tell what is in flight** — `build.xml` is written when a build *finishes*, so looking
+for builds without a `<result>` gives a false all-clear. Use the live log instead:
+
+```
+find /var/lib/jenkins/jobs -path '*/builds/*' -name log -newermt '-3 minutes' | wc -l
+grep -c 'BuildableItem\|WaitingItem\|BlockedItem' /var/lib/jenkins/queue.xml
+```
+
+Both must read 0. At 11:22 UTC on 2026-08-18 they read 5 and 2 — `prod/fe #1566`,
+`uat/batchprocessor #152`, `ecr-replication #485`, `qa1/ckauto #273`,
+`dev3/Stormus-Build-Publish-NexusJob #142` running, with `nonprod-ck-drupal-deploy-app #1598`
+queued for an executor.
 
 ### 5. `numExecutors` — a POC artefact, NOT an infra concern
 
